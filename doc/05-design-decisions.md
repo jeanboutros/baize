@@ -160,3 +160,21 @@ World-readable would expose the kubeconfig (which includes cluster credentials) 
 **Decision:** `Architecture: arm64` in the control file.
 
 **Reasoning:** This package is specifically designed for the Raspberry Pi 5, which uses an arm64 (AArch64) processor. The minikube and kubectl binaries downloaded are the arm64 builds. The cgroup boot parameters and kernel assumptions are specific to the Raspberry Pi kernel. There is no tested or supported path for x86_64 or armhf.
+
+---
+
+## Why `--no-vtx-check` on minikube start?
+
+**Decision:** The minikube systemd service and the `start_cluster()` function both pass `--no-vtx-check` to `minikube start`.
+
+**Alternatives considered:**
+- Omit the flag and let minikube perform its default hardware virtualisation check
+- Use a different driver that does not require virtualisation
+
+**Reasoning:** The `--no-vtx-check` flag disables minikube's check for hardware virtualisation support (KVM on Linux, Hyper-V on Windows). On x86_64 systems, minikube can use KVM to run a lightweight VM for the Kubernetes node, and the virtualisation check ensures KVM is available before attempting to start.
+
+The Raspberry Pi 5 is an arm64 (AArch64) platform. It does not have KVM or any hardware virtualisation extensions available. On arm64, minikube uses software emulation (QEMU under the hood) rather than hardware-accelerated virtualisation. The virtualisation check would always fail on this platform, blocking the cluster from starting.
+
+The flag is a **no-op on arm64** — it simply skips a check that is irrelevant to the platform. It does not disable any actual virtualisation feature, because none exists to disable. The cluster runs correctly with software emulation, and the flag is safe to use permanently on this hardware.
+
+This is documented here so that future maintainers do not remove the flag thinking it is unnecessary or a workaround for a transient issue. It is a permanent, platform-appropriate configuration.

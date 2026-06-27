@@ -18,7 +18,6 @@ MINIKUBE_BIN="/usr/local/bin/minikube"
 KUBECTL_BIN="/usr/local/bin/kubectl"
 MINIKUBE_SERVICE_DIR="${BAIZE_HOME}/.config/systemd/user"
 MINIKUBE_SERVICE="${MINIKUBE_SERVICE_DIR}/minikube.service"
-DOC_DIR="/usr/share/doc/baize-kube"
 CONSUMERS_CONF="/etc/baize-kube/consumers.conf"
 REBOOT_SERVICE_SRC="/usr/lib/baize-kube/baize-kube-reboot.service"
 REBOOT_SERVICE_DST="/etc/systemd/system/baize-kube-reboot.service"
@@ -462,7 +461,7 @@ start_cluster() {
 
     # Verify the API server is responding before proceeding
     info "Verifying cluster is healthy..."
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         if runuser -l "$BAIZE_USER" -s /bin/bash -c "
             export HOME=${BAIZE_HOME}
             export XDG_RUNTIME_DIR=/run/user/\$(id -u)
