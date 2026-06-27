@@ -1,6 +1,6 @@
 # Bai Ze (白泽; pinyin: Báizé)
 
-Bai Ze (白泽), the mythical creature who catalogued all the spirits of the world, now orchestrates a rootless [minikube](https://minikube.sigs.k8s.io/) Kubernetes cluster on a Raspberry Pi 5 (arm64) — proving that big infrastructure can run on small machines.
+Rootless minikube Kubernetes on Raspberry Pi 5, inspired by Bai Ze (白泽) the Chinese mythical creature symbolizing virtue and immense knowledge, and said to understand the languages of all living creatures and know the nature of all spirits.
 
 ---
 
