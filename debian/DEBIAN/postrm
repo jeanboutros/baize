@@ -1,0 +1,136 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# baize-kube postrm
+# Cleans up on package removal: stops services, removes user, groups, binaries,
+# kubeconfig, profile snippet, and cgroup delegation config.
+# Does NOT reverse the cmdline.txt patch — that requires an intentional reboot.
+# =============================================================================
+
+BAIZE_USER="baize"
+CONSUMERS_GROUP="baize-consumers"
+BAIZE_HOME="/home/${BAIZE_USER}"
+KUBECONFIG_SHARED_DIR="/etc/baize-kube"
+DELEGATE_CONF="/etc/systemd/system/user@.service.d/delegate.conf"
+MINIKUBE_BIN="/usr/local/bin/minikube"
+KUBECTL_BIN="/usr/local/bin/kubectl"
+PROFILE_SNIPPET="/etc/profile.d/baize-kube.sh"
+
+info()    { echo "[baize-kube] INFO:  $*"; }
+success() { echo "[baize-kube] OK:    $*"; }
+warn()    { echo "[baize-kube] WARN:  $*"; }
+
+# Only run full cleanup on 'remove' or 'purge', not on upgrade
+ACTION="${1:-}"
+if [ "$ACTION" != "remove" ] && [ "$ACTION" != "purge" ]; then
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# 1. Stop and disable minikube user service
+# -----------------------------------------------------------------------------
+
+info "Stopping minikube cluster and user service..."
+if id "$BAIZE_USER" > /dev/null 2>&1; then
+    runuser -l "$BAIZE_USER" -s /bin/bash -c "
+        export HOME=${BAIZE_HOME}
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        export MINIKUBE_ROOTLESS=true
+        systemctl --user stop minikube.service 2>/dev/null || true
+        systemctl --user disable minikube.service 2>/dev/null || true
+        ${MINIKUBE_BIN} delete --all 2>/dev/null || true
+    " 2>/dev/null || warn "Could not cleanly stop minikube service (may already be stopped)."
+    success "minikube service stopped."
+fi
+
+# -----------------------------------------------------------------------------
+# 2. Disable lingering for baize
+# -----------------------------------------------------------------------------
+
+info "Disabling systemd lingering for '${BAIZE_USER}'..."
+loginctl disable-linger "$BAIZE_USER" 2>/dev/null || true
+success "Lingering disabled."
+
+# -----------------------------------------------------------------------------
+# 3. Remove baize user and home directory
+# -----------------------------------------------------------------------------
+
+info "Removing user '${BAIZE_USER}'..."
+if id "$BAIZE_USER" > /dev/null 2>&1; then
+    userdel --remove "$BAIZE_USER" 2>/dev/null || userdel "$BAIZE_USER" 2>/dev/null || true
+    rm -rf "$BAIZE_HOME"
+    success "User '${BAIZE_USER}' and home directory removed."
+else
+    info "User '${BAIZE_USER}' does not exist — skipping."
+fi
+
+# Remove subuid/subgid entries
+sed -i "/^${BAIZE_USER}:/d" /etc/subuid 2>/dev/null || true
+sed -i "/^${BAIZE_USER}:/d" /etc/subgid 2>/dev/null || true
+success "subuid/subgid entries removed."
+
+# -----------------------------------------------------------------------------
+# 4. Remove baize-consumers group
+# -----------------------------------------------------------------------------
+
+info "Removing group '${CONSUMERS_GROUP}'..."
+if getent group "$CONSUMERS_GROUP" > /dev/null 2>&1; then
+    groupdel "$CONSUMERS_GROUP" 2>/dev/null || true
+    success "Group '${CONSUMERS_GROUP}' removed."
+else
+    info "Group '${CONSUMERS_GROUP}' does not exist — skipping."
+fi
+
+# -----------------------------------------------------------------------------
+# 5. Remove shared kubeconfig and config directory
+# -----------------------------------------------------------------------------
+
+info "Removing shared kubeconfig directory..."
+rm -rf "$KUBECONFIG_SHARED_DIR"
+success "Removed ${KUBECONFIG_SHARED_DIR}."
+
+# -----------------------------------------------------------------------------
+# 6. Remove binaries
+# -----------------------------------------------------------------------------
+
+info "Removing minikube and kubectl binaries..."
+rm -f "$MINIKUBE_BIN" "$KUBECTL_BIN"
+success "Binaries removed."
+
+# -----------------------------------------------------------------------------
+# 7. Remove cgroup delegation config
+# -----------------------------------------------------------------------------
+
+info "Removing cgroup delegation config..."
+rm -f "$DELEGATE_CONF"
+# Remove the directory if it's now empty
+rmdir "$(dirname "$DELEGATE_CONF")" 2>/dev/null || true
+systemctl daemon-reload
+success "cgroup delegation config removed."
+
+# -----------------------------------------------------------------------------
+# 8. Remove shell profile snippet
+# -----------------------------------------------------------------------------
+
+info "Removing shell profile snippet..."
+rm -f "$PROFILE_SNIPPET"
+success "Profile snippet removed."
+
+# -----------------------------------------------------------------------------
+# 9. Note about cmdline.txt
+# -----------------------------------------------------------------------------
+
+echo ""
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  baize-kube removed                                         ║"
+echo "║                                                             ║"
+echo "║  NOTE: /boot/firmware/cmdline.txt was NOT modified.        ║"
+echo "║  The cgroup_memory=1 cgroup_enable=memory parameters       ║"
+echo "║  remain in place. To remove them manually:                  ║"
+echo "║                                                             ║"
+echo "║    sudo nano /boot/firmware/cmdline.txt                    ║"
+echo "║                                                             ║"
+echo "║  Remove the following from the line, then reboot:          ║"
+echo "║    cgroup_memory=1 cgroup_enable=memory                    ║"
+echo "╚══════════════════════════════════════════════════════════════╝"

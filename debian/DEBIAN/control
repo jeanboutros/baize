@@ -1,0 +1,10 @@
+Package: baize-kube
+Version: 1.0
+Architecture: arm64
+Maintainer: Jean Boutros <jean.boutros@if-you-know-you-know.com>
+Depends: podman, curl, systemd
+Description: Rootless minikube cluster service for Raspberry Pi
+ Provisions a dedicated system user (baize) that owns and runs a rootless
+ minikube cluster via Podman at boot using systemd user services with
+ lingering. Configures cgroup v2 memory delegation and grants cluster
+ read access to the baize-consumers group.

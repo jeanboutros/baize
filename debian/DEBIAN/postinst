@@ -1,0 +1,374 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# baize-kube postinst
+# Provisions the baize user, cgroup delegation, minikube, and systemd service.
+# =============================================================================
+
+BAIZE_USER="baize"
+BAIZE_GROUP="baize"
+CONSUMERS_GROUP="baize-consumers"
+BAIZE_HOME="/home/${BAIZE_USER}"
+KUBECONFIG_SHARED="/etc/baize-kube/kubeconfig"
+CMDLINE_FILE="/boot/firmware/cmdline.txt"
+DELEGATE_CONF="/etc/systemd/system/user@.service.d/delegate.conf"
+MINIKUBE_BIN="/usr/local/bin/minikube"
+KUBECTL_BIN="/usr/local/bin/kubectl"
+MINIKUBE_SERVICE_DIR="${BAIZE_HOME}/.config/systemd/user"
+MINIKUBE_SERVICE="${MINIKUBE_SERVICE_DIR}/minikube.service"
+DOC_DIR="/usr/share/doc/baize-kube"
+
+ARCH="arm64"
+MINIKUBE_URL="https://storage.googleapis.com/minikube/releases/latest/minikube-linux-${ARCH}"
+KUBECTL_URL="https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+info()    { echo "[baize-kube] INFO:  $*"; }
+success() { echo "[baize-kube] OK:    $*"; }
+warn()    { echo "[baize-kube] WARN:  $*"; }
+fail()    { echo "[baize-kube] ERROR: $*" >&2; exit 1; }
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || fail "This script must be run as root."
+}
+
+# -----------------------------------------------------------------------------
+# 1. Network connectivity check
+# -----------------------------------------------------------------------------
+
+check_network() {
+    info "Checking network connectivity..."
+    curl -fsSL --max-time 10 -o /dev/null https://storage.googleapis.com/ \
+        || fail "Cannot reach storage.googleapis.com. Ensure internet access before installing."
+    curl -fsSL --max-time 10 -o /dev/null https://dl.k8s.io/ \
+        || fail "Cannot reach dl.k8s.io. Ensure internet access before installing."
+    success "Network connectivity confirmed."
+}
+
+# -----------------------------------------------------------------------------
+# 2. cgroup v2 memory controller check and cmdline.txt patch
+# -----------------------------------------------------------------------------
+
+check_and_patch_cgroup() {
+    info "Checking cgroup v2 memory controller..."
+
+    CONTROLLERS=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || echo "")
+
+    if echo "$CONTROLLERS" | grep -qw "memory"; then
+        info "cgroup memory controller already active — skipping cmdline.txt edit."
+        return 0
+    fi
+
+    warn "cgroup memory controller is NOT active."
+    info "Checking ${CMDLINE_FILE}..."
+
+    [ -f "$CMDLINE_FILE" ] || fail "${CMDLINE_FILE} not found. Cannot enable memory cgroup."
+
+    CMDLINE=$(cat "$CMDLINE_FILE")
+
+    if echo "$CMDLINE" | grep -q "cgroup_enable=memory"; then
+        info "cgroup_enable=memory already present in ${CMDLINE_FILE} — skipping edit."
+    else
+        info "Patching ${CMDLINE_FILE} to enable memory cgroup..."
+        # Must remain a single line
+        cp "$CMDLINE_FILE" "${CMDLINE_FILE}.bak-baize-kube"
+        echo "${CMDLINE} cgroup_memory=1 cgroup_enable=memory" > "$CMDLINE_FILE"
+        success "Patched ${CMDLINE_FILE}. A reboot is required before continuing."
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║  REBOOT REQUIRED                                            ║"
+        echo "║                                                             ║"
+        echo "║  The kernel boot parameters have been updated to enable     ║"
+        echo "║  the cgroup memory controller, which is required for        ║"
+        echo "║  rootless Podman to enforce memory limits on containers.    ║"
+        echo "║                                                             ║"
+        echo "║  Please reboot now:                                         ║"
+        echo "║    sudo reboot                                              ║"
+        echo "║                                                             ║"
+        echo "║  After reboot, re-run the installer:                        ║"
+        echo "║    sudo dpkg -i baize-kube_1.0_arm64.deb                   ║"
+        echo "╚══════════════════════════════════════════════════════════════╝"
+        echo ""
+        exit 0  # Exit cleanly — installer must be re-run after reboot
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# 3. systemd cgroup delegation for user sessions
+# -----------------------------------------------------------------------------
+
+configure_cgroup_delegation() {
+    info "Configuring systemd cgroup delegation..."
+    mkdir -p "$(dirname "$DELEGATE_CONF")"
+    cat > "$DELEGATE_CONF" <<EOF
+[Service]
+Delegate=cpu cpuset io memory pids
+EOF
+    systemctl daemon-reload
+    success "cgroup delegation configured at ${DELEGATE_CONF}."
+}
+
+# -----------------------------------------------------------------------------
+# 4. Create baize user and baize-consumers group
+# -----------------------------------------------------------------------------
+
+provision_user() {
+    info "Provisioning user and groups..."
+
+    # baize-consumers group for huyang and others to read the kubeconfig
+    if ! getent group "$CONSUMERS_GROUP" > /dev/null 2>&1; then
+        groupadd --system "$CONSUMERS_GROUP"
+        success "Group '${CONSUMERS_GROUP}' created."
+    else
+        info "Group '${CONSUMERS_GROUP}' already exists."
+    fi
+
+    # baize user: regular user (not system) so it gets subuid/subgid ranges
+    # required for rootless Podman user namespace mapping
+    if ! id "$BAIZE_USER" > /dev/null 2>&1; then
+        useradd \
+            --create-home \
+            --home-dir "$BAIZE_HOME" \
+            --shell /usr/sbin/nologin \
+            --comment "baize minikube service account" \
+            --groups "$CONSUMERS_GROUP" \
+            "$BAIZE_USER"
+        # Lock the password — no interactive login
+        passwd -l "$BAIZE_USER"
+        success "User '${BAIZE_USER}' created and locked."
+    else
+        info "User '${BAIZE_USER}' already exists."
+    fi
+
+    # Ensure subuid and subgid ranges exist for rootless Podman
+    if ! grep -q "^${BAIZE_USER}:" /etc/subuid 2>/dev/null; then
+        # Find a free range starting after any existing entries
+        LAST_SUBUID=$(awk -F: '{print $2+$3}' /etc/subuid 2>/dev/null | sort -n | tail -1)
+        START=${LAST_SUBUID:-100000}
+        echo "${BAIZE_USER}:${START}:65536" >> /etc/subuid
+        success "subuid range ${START}:65536 assigned to ${BAIZE_USER}."
+    else
+        info "subuid entry for '${BAIZE_USER}' already exists."
+    fi
+
+    if ! grep -q "^${BAIZE_USER}:" /etc/subgid 2>/dev/null; then
+        LAST_SUBGID=$(awk -F: '{print $2+$3}' /etc/subgid 2>/dev/null | sort -n | tail -1)
+        START=${LAST_SUBGID:-100000}
+        echo "${BAIZE_USER}:${START}:65536" >> /etc/subgid
+        success "subgid range ${START}:65536 assigned to ${BAIZE_USER}."
+    else
+        info "subgid entry for '${BAIZE_USER}' already exists."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# 5. Add consumer users to baize-consumers group
+# -----------------------------------------------------------------------------
+
+add_consumers() {
+    info "Adding consumer users to '${CONSUMERS_GROUP}'..."
+
+    # Add all non-system human users (UID >= 1000, not baize itself)
+    while IFS=: read -r username _ uid _; do
+        if [ "$uid" -ge 1000 ] && [ "$username" != "$BAIZE_USER" ]; then
+            if id "$username" > /dev/null 2>&1; then
+                usermod -aG "$CONSUMERS_GROUP" "$username"
+                success "Added '${username}' to '${CONSUMERS_GROUP}'."
+            fi
+        fi
+    done < /etc/passwd
+}
+
+# -----------------------------------------------------------------------------
+# 6. Download minikube and kubectl binaries
+# -----------------------------------------------------------------------------
+
+download_binaries() {
+    info "Downloading minikube (latest, ${ARCH})..."
+    curl -fsSL --max-time 120 -o "$MINIKUBE_BIN" "$MINIKUBE_URL" \
+        || fail "Failed to download minikube from ${MINIKUBE_URL}."
+    chmod +x "$MINIKUBE_BIN"
+    success "minikube installed at ${MINIKUBE_BIN}."
+
+    info "Resolving latest kubectl version..."
+    K8S_VERSION=$(curl -fsSL --max-time 10 https://dl.k8s.io/release/stable.txt) \
+        || fail "Failed to resolve latest kubectl version."
+    KUBECTL_VERSIONED_URL="https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/${ARCH}/kubectl"
+
+    info "Downloading kubectl ${K8S_VERSION} (${ARCH})..."
+    curl -fsSL --max-time 120 -o "$KUBECTL_BIN" "$KUBECTL_VERSIONED_URL" \
+        || fail "Failed to download kubectl from ${KUBECTL_VERSIONED_URL}."
+    chmod +x "$KUBECTL_BIN"
+    success "kubectl ${K8S_VERSION} installed at ${KUBECTL_BIN}."
+}
+
+# -----------------------------------------------------------------------------
+# 7. Enable systemd lingering for baize
+# -----------------------------------------------------------------------------
+
+enable_lingering() {
+    info "Enabling systemd lingering for '${BAIZE_USER}'..."
+    loginctl enable-linger "$BAIZE_USER"
+    success "Lingering enabled — baize user services will start at boot."
+}
+
+# -----------------------------------------------------------------------------
+# 8. Configure minikube for baize user
+# -----------------------------------------------------------------------------
+
+configure_minikube() {
+    info "Configuring minikube for user '${BAIZE_USER}'..."
+
+    runuser -l "$BAIZE_USER" -s /bin/bash -c "
+        export HOME=${BAIZE_HOME}
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        minikube config set driver podman
+        minikube config set rootless true
+        minikube config set container-runtime containerd
+    " || fail "Failed to configure minikube for ${BAIZE_USER}."
+
+    success "minikube configured for '${BAIZE_USER}'."
+}
+
+# -----------------------------------------------------------------------------
+# 9. Install systemd user service for minikube
+# -----------------------------------------------------------------------------
+
+install_service() {
+    info "Installing minikube systemd user service for '${BAIZE_USER}'..."
+
+    mkdir -p "$MINIKUBE_SERVICE_DIR"
+    chown -R "${BAIZE_USER}:${BAIZE_GROUP}" "${BAIZE_HOME}/.config"
+
+    cat > "$MINIKUBE_SERVICE" <<EOF
+[Unit]
+Description=minikube Kubernetes cluster
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+Environment=HOME=${BAIZE_HOME}
+Environment=MINIKUBE_ROOTLESS=true
+ExecStart=${MINIKUBE_BIN} start --driver=podman --no-vtx-check
+ExecStop=${MINIKUBE_BIN} stop
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target
+EOF
+
+    chown "${BAIZE_USER}:${BAIZE_GROUP}" "$MINIKUBE_SERVICE"
+
+    # Enable the service as the baize user
+    runuser -l "$BAIZE_USER" -s /bin/bash -c "
+        export HOME=${BAIZE_HOME}
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        systemctl --user daemon-reload
+        systemctl --user enable minikube.service
+    " || fail "Failed to enable minikube user service."
+
+    success "minikube user service installed and enabled."
+}
+
+# -----------------------------------------------------------------------------
+# 10. Start minikube cluster and export kubeconfig
+# -----------------------------------------------------------------------------
+
+start_cluster() {
+    info "Starting minikube cluster as '${BAIZE_USER}' (this may take several minutes)..."
+
+    runuser -l "$BAIZE_USER" -s /bin/bash -c "
+        export HOME=${BAIZE_HOME}
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        export MINIKUBE_ROOTLESS=true
+        ${MINIKUBE_BIN} start --driver=podman --no-vtx-check
+    " || fail "minikube failed to start. Check: sudo -u baize minikube logs"
+
+    success "minikube cluster started."
+}
+
+# -----------------------------------------------------------------------------
+# 11. Provision shared kubeconfig for consumers
+# -----------------------------------------------------------------------------
+
+provision_kubeconfig() {
+    info "Provisioning shared kubeconfig for '${CONSUMERS_GROUP}'..."
+
+    mkdir -p /etc/baize-kube
+    chown "root:${CONSUMERS_GROUP}" /etc/baize-kube
+    chmod 750 /etc/baize-kube
+
+    runuser -l "$BAIZE_USER" -s /bin/bash -c "
+        export HOME=${BAIZE_HOME}
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        export MINIKUBE_ROOTLESS=true
+        ${MINIKUBE_BIN} kubectl -- config view --flatten > ${KUBECONFIG_SHARED}
+    " || fail "Failed to export kubeconfig."
+
+    chown "root:${CONSUMERS_GROUP}" "$KUBECONFIG_SHARED"
+    chmod 640 "$KUBECONFIG_SHARED"
+
+    success "Shared kubeconfig written to ${KUBECONFIG_SHARED}."
+    success "Members of '${CONSUMERS_GROUP}' can access it with:"
+    success "  export KUBECONFIG=${KUBECONFIG_SHARED}"
+}
+
+# -----------------------------------------------------------------------------
+# 12. Shell profile hint for consumers
+# -----------------------------------------------------------------------------
+
+install_profile_hint() {
+    PROFILE_SNIPPET="/etc/profile.d/baize-kube.sh"
+    cat > "$PROFILE_SNIPPET" <<EOF
+# baize-kube: set KUBECONFIG for members of ${CONSUMERS_GROUP}
+if id -nG "\$USER" 2>/dev/null | grep -qw "${CONSUMERS_GROUP}"; then
+    export KUBECONFIG=${KUBECONFIG_SHARED}
+fi
+EOF
+    chmod 644 "$PROFILE_SNIPPET"
+    success "Shell profile snippet installed at ${PROFILE_SNIPPET}."
+    success "KUBECONFIG will be auto-set for all members of '${CONSUMERS_GROUP}' on next login."
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+require_root
+check_network
+check_and_patch_cgroup
+configure_cgroup_delegation
+provision_user
+add_consumers
+download_binaries
+enable_lingering
+configure_minikube
+install_service
+start_cluster
+provision_kubeconfig
+install_profile_hint
+
+echo ""
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  baize-kube installation complete                           ║"
+echo "║                                                             ║"
+echo "║  Cluster owner:  baize  (locked, no interactive login)     ║"
+echo "║  Consumers:      members of 'baize-consumers' group        ║"
+echo "║  Kubeconfig:     /etc/baize-kube/kubeconfig                ║"
+echo "║                                                             ║"
+echo "║  Log out and back in, then run:                            ║"
+echo "║    kubectl get nodes                                        ║"
+echo "║                                                             ║"
+echo "║  To reconfigure minikube:                                   ║"
+echo "║    sudo -u baize minikube <command>                        ║"
+echo "║                                                             ║"
+echo "║  To check service status:                                   ║"
+echo "║    sudo -u baize systemctl --user status minikube          ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
