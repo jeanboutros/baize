@@ -1,7 +1,7 @@
 .PHONY: all build clean lint test install
 
 PACKAGE := baize-kube
-VERSION := 1.0
+VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.0.0")
 ARCH := arm64
 DEB := $(PACKAGE)_$(VERSION)_$(ARCH).deb
 
@@ -10,6 +10,7 @@ all: lint build
 build:
 	@mkdir -p debian/usr/share/doc/baize-kube
 	@cp doc/*.md debian/usr/share/doc/baize-kube/
+	@sed -i.bak "s/^Version:.*/Version: $(VERSION)/" debian/DEBIAN/control
 	dpkg-deb --build debian $(DEB)
 	@echo "Built: $(DEB)"
 
@@ -32,6 +33,7 @@ test:
 clean:
 	rm -f $(DEB)
 	rm -rf debian/usr/share/doc/baize-kube/
+	@if [ -f debian/DEBIAN/control.bak ]; then mv debian/DEBIAN/control.bak debian/DEBIAN/control; fi
 
 install:
 	sudo dpkg -i $(DEB)

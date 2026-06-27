@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set version from tag
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Build package
+        run: make build VERSION=${{ env.VERSION }}
+
+      - name: Generate changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            git log --oneline --no-decorate ${PREV_TAG}..HEAD > CHANGELOG.txt
+          else
+            git log --oneline --no-decorate > CHANGELOG.txt
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "baize-kube v${{ env.VERSION }}"
+          body_path: CHANGELOG.txt
+          files: baize-kube_${{ env.VERSION }}_arm64.deb
+          generate_release_notes: true

@@ -1,6 +1,6 @@
 # Bai Ze (白泽; pinyin: Báizé)
 
-A Debian package that provisions a rootless [minikube](https://minikube.sigs.k8s.io/) Kubernetes cluster on a Raspberry Pi 5 (arm64), owned by a dedicated locked service account (`baize`) and accessible to human users through per-user kubeconfigs with role-based access control.
+Bai Ze (白泽), the mythical creature who catalogued all the spirits of the world, now orchestrates a rootless [minikube](https://minikube.sigs.k8s.io/) Kubernetes cluster on a Raspberry Pi 5 (arm64) — proving that big infrastructure can run on small machines.
 
 ---
 
