@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+# baize-kube prerm
+# Runs BEFORE package files are removed.
+# Cleans up the minikube cluster while the binary still exists.
+
+ACTION="${1:-}"
+
+# Only run cluster cleanup on remove/purge, not upgrade
+if [ "$ACTION" != "remove" ] && [ "$ACTION" != "purge" ]; then
+    exit 0
+fi
+
+BAIZE_USER="baize"
+BAIZE_HOME="/home/${BAIZE_USER}"
+MINIKUBE_BIN="/usr/local/bin/minikube"
+
+info()  { echo "[baize-kube] INFO:  $*"; }
+warn()  { echo "[baize-kube] WARN:  $*"; }
+
+# Only attempt cleanup if the baize user and minikube binary exist
+if ! id "$BAIZE_USER" > /dev/null 2>&1; then
+    exit 0
+fi
+
+if [ ! -x "$MINIKUBE_BIN" ]; then
+    exit 0
+fi
+
+info "Stopping and deleting minikube cluster before package removal..."
+
+runuser -l "$BAIZE_USER" -s /bin/bash -c "
+    export HOME=${BAIZE_HOME}
+    export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+    export MINIKUBE_ROOTLESS=true
+    ${MINIKUBE_BIN} stop 2>/dev/null || true
+    ${MINIKUBE_BIN} delete --all 2>/dev/null || true
+" 2>/dev/null || warn "Could not cleanly stop minikube (may already be stopped)."
+
+info "Cluster cleanup complete."

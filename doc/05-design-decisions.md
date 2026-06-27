@@ -9,10 +9,10 @@ Every significant choice in this package was a deliberate trade-off. This docume
 **Decision:** The cluster is owned by a locked user account `baize`, separate from any human user.
 
 **Alternatives considered:**
-- Run minikube as `huyang` directly
+- Run minikube as a consumer directly
 - Run minikube as root
 
-**Reasoning:** Running minikube as `huyang` ties the cluster lifecycle to `huyang`'s login session. If `huyang` logs out, the cluster stops. It also means the cluster's state files, credentials, and configuration live in `huyang`'s home directory, mixing personal and infrastructure concerns.
+**Reasoning:** Running minikube as a consumer ties the cluster lifecycle to that consumer's login session. If the consumer logs out, the cluster stops. It also means the cluster's state files, credentials, and configuration live in the consumer's home directory, mixing personal and infrastructure concerns.
 
 Running as root defeats the purpose of rootless containers entirely and introduces a privileged daemon pattern similar to the Docker socket problem.
 
@@ -42,7 +42,7 @@ Despite being a regular user by UID range, `baize` has no interactive login capa
 - Rootless Docker
 - nerdctl + containerd directly
 
-**Reasoning:** The Docker socket model (`/var/run/docker.sock`) grants root-equivalent access to anyone who can write to it. This is a well-documented privilege escalation vector and is not appropriate for a shared machine where `huyang` is a consumer with limited privilege.
+**Reasoning:** The Docker socket model (`/var/run/docker.sock`) grants root-equivalent access to anyone who can write to it. This is a well-documented privilege escalation vector and is not appropriate for a shared machine where consumers have limited privilege.
 
 Rootless Podman does not require a daemon and does not use a socket owned by root. Each user's Podman instance is a peer process. This is the direction the OCI container ecosystem is moving and is the explicit recommendation of the Podman and Kubernetes projects for development clusters.
 
@@ -70,7 +70,7 @@ Rootless Docker exists but is more complex to configure than Podman on Debian-de
 - Set a password for `baize` for administrative access
 - Allow SSH login for `baize`
 
-**Reasoning:** The `baize` account is infrastructure, not a person. No human should log in as `baize` interactively. Administrative access to the cluster is done by `huyang` via `sudo -u baize`, which requires `huyang` to authenticate with their own password. This preserves a full audit trail: the sudo log records who did what, as whom, and when.
+**Reasoning:** The `baize` account is infrastructure, not a person. No human should log in as `baize` interactively. Administrative access to the cluster is done by a consumer via `sudo -u baize`, which requires the consumer to authenticate with their own password. This preserves a full audit trail: the sudo log records who did what, as whom, and when.
 
 An account that nobody should log into should be incapable of logging in.
 
@@ -81,8 +81,8 @@ An account that nobody should log into should be incapable of logging in.
 **Decision:** Cluster administrators use `sudo -u baize minikube <command>`.
 
 **Alternatives considered:**
-- Give `huyang` write access to `baize`'s home directory
-- Add `huyang` to the `baize` group with write permissions on `.minikube/`
+- Give a consumer write access to `baize`'s home directory
+- Add a consumer to the `baize` group with write permissions on `.minikube/`
 
 **Reasoning:** `sudo -u baize` runs the command with exactly `baize`'s privileges — no more, no less. It is auditable via sudo logs. It does not require granting write access to `baize`'s home directory, which would be an overly broad permission.
 
@@ -106,17 +106,17 @@ Lingering tells systemd to start and keep `baize`'s user session alive from boot
 
 ## Why does the installer hard-block on a reboot if cmdline.txt is patched?
 
-**Decision:** The installer exits with code 0 after patching `cmdline.txt`, requiring the user to reboot and re-run `dpkg -i`.
+**Decision:** The installer exits with code **1** after patching `cmdline.txt`, leaving the package in "Half-Configured" state. A oneshot systemd service (`baize-kube-reboot.service`) completes the installation automatically on the next boot. No manual re-run of `dpkg -i` is required.
 
 **Alternatives considered:**
 - Warn and continue (leave system in broken state)
-- Schedule a post-reboot script to finish installation
+- Exit with code 0 and require the user to manually re-run `dpkg -i`
 
 **Reasoning:** The memory cgroup controller cannot be activated without a reboot. If the installer continues without it, minikube will fail to start with the same error that prompted this package to be written. Leaving the system in a half-installed state is worse than stopping cleanly with clear instructions.
 
-A post-reboot script (via `rc.local` or a one-shot systemd unit) would run with no user present to see errors. If something went wrong in the second phase, there would be no visible output and the user would have a broken system with no explanation.
+Exiting with code 1 and using dpkg's "Half-Configured" state is the correct Debian packaging pattern for installations that require a reboot to complete. The oneshot systemd service runs on next boot, completes the installation (downloading binaries, provisioning the `baize` user, starting the cluster), and then marks the package as fully installed via `dpkg --configure`. The service logs all output to the journal, so the user can inspect the result with `systemctl status baize-kube-reboot` or `journalctl -u baize-kube-reboot`.
 
-Stopping and asking the user to reboot and re-run is transparent, idempotent, and puts the user in control.
+This approach is transparent (the user is told to reboot and check the service), idempotent (the oneshot service is guarded by a condition file), and does not require the user to remember to re-run a command after reboot.
 
 ---
 
@@ -138,13 +138,18 @@ A proper package repository (apt source) for minikube exists but requires trusti
 
 ## Why the `baize-consumers` group for kubeconfig access?
 
-**Decision:** A dedicated group `baize-consumers` controls who can read the shared kubeconfig.
+**Decision:** Two groups control cluster access with different models. `baize-admins` get a shared admin kubeconfig at `/etc/baize-kube/admin-kubeconfig`. `baize-consumers` get no automatic access — each consumer is provisioned individually via `baize-kube-add-consumer`, which creates a per-user kubeconfig at `~<username>/.kube/config` (mode 600, user-owned).
 
 **Alternatives considered:**
-- Copy the kubeconfig to each consumer's home directory
+- Copy the kubeconfig to each consumer's home directory (old shared-kubeconfig model)
 - Make the kubeconfig world-readable
+- A single shared kubeconfig for all consumers
 
-**Reasoning:** Copying to each home directory creates N copies that can go stale when the cluster is reconfigured. The group model means there is one canonical kubeconfig that is always current. Adding a new consumer is one command: `usermod -aG baize-consumers <username>`.
+**Reasoning:** The old model of a single shared kubeconfig for all consumers had two problems: (1) all consumers shared the same credentials, making it impossible to assign different roles (view vs. edit) to different users; (2) revoking one consumer's access required rotating credentials for everyone.
+
+The two-group per-user RBAC model solves both. Each consumer gets a dedicated Kubernetes ServiceAccount with a per-user token. The `baize-kube-add-consumer` script creates the ServiceAccount, generates a token, and writes a kubeconfig to the user's home directory. The `--role` flag (default `view`, also `edit`) controls the RBAC role binding. Token-based auth is revocable: deleting the ServiceAccount immediately cuts off that user's access without affecting anyone else.
+
+Filesystem isolation (mode 600, user-owned) prevents credential sharing between consumers. The admin kubeconfig at `/etc/baize-kube/admin-kubeconfig` is group-readable by `baize-admins` (mode 640) and provides cluster-admin access for administrative operations.
 
 World-readable would expose the kubeconfig (which includes cluster credentials) to any process on the system. The group model restricts access to explicitly authorised users.
 

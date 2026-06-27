@@ -1,0 +1,284 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# baize-kube-remove-consumer — Deprovision a Kubernetes consumer user
+#
+# Removes the per-user ServiceAccount, token Secret, RBAC bindings,
+# and per-user kubeconfig at ~<username>/.kube/config.
+#
+# Usage:
+#   baize-kube-remove-consumer <username> [--dry-run] [--remove-group]
+# =============================================================================
+
+ADMIN_KUBECONFIG="/etc/baize-kube/admin-kubeconfig"
+CONSUMERS_GROUP="baize-consumers"
+KUBECTL="/usr/local/bin/kubectl"
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+info()    { echo "[baize-kube] INFO:  $*"; }
+success() { echo "[baize-kube] OK:    $*"; }
+warn()    { echo "[baize-kube] WARN:  $*"; }
+fail()    { echo "[baize-kube] ERROR: $*" >&2; exit 1; }
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || fail "This script must be run as root (or via sudo)."
+}
+
+usage() {
+    cat <<EOF
+Usage: baize-kube-remove-consumer <username> [OPTIONS]
+
+Remove a consumer's Kubernetes access:
+  1. Deletes the kubeconfig at ~<username>/.kube/config
+  2. Deletes the RoleBinding and/or ClusterRoleBinding
+  3. Deletes the token Secret
+  4. Deletes the ServiceAccount
+
+OPTIONS:
+  --dry-run        Show what would be done without making changes
+  --remove-group   Also remove the user from the '${CONSUMERS_GROUP}' group
+  -h, --help       Show this help message
+EOF
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Argument parsing
+# -----------------------------------------------------------------------------
+
+parse_args() {
+    USERNAME=""
+    DRY_RUN=false
+    REMOVE_GROUP=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --remove-group)
+                REMOVE_GROUP=true
+                shift
+                ;;
+            -*)
+                fail "Unknown option: $1"
+                ;;
+            *)
+                if [ -z "$USERNAME" ]; then
+                    USERNAME="$1"
+                else
+                    fail "Unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$USERNAME" ]; then
+        fail "Username is required. See --help for usage."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+
+validate() {
+    # Check user exists on system
+    if ! id "$USERNAME" > /dev/null 2>&1; then
+        warn "User '${USERNAME}' does not exist on this system. Skipping filesystem cleanup."
+        USER_EXISTS=false
+    else
+        USER_EXISTS=true
+    fi
+
+    # Check admin kubeconfig exists
+    if [ ! -r "$ADMIN_KUBECONFIG" ]; then
+        warn "Admin kubeconfig not found at ${ADMIN_KUBECONFIG}. Skipping Kubernetes resource cleanup."
+        CLUSTER_ACCESSIBLE=false
+        return
+    fi
+
+    # Check kubectl exists
+    if [ ! -x "$KUBECTL" ]; then
+        warn "kubectl not found at ${KUBECTL}. Skipping Kubernetes resource cleanup."
+        CLUSTER_ACCESSIBLE=false
+        return
+    fi
+
+    # Check cluster is running
+    if ! KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get nodes --request-timeout=5s > /dev/null 2>&1; then
+        warn "Cannot reach the Kubernetes cluster. Skipping Kubernetes resource cleanup."
+        CLUSTER_ACCESSIBLE=false
+        return
+    fi
+
+    CLUSTER_ACCESSIBLE=true
+}
+
+# -----------------------------------------------------------------------------
+# Clean up Kubernetes resources
+# -----------------------------------------------------------------------------
+
+# Helper: delete a Kubernetes resource if it exists
+_delete_k8s_resource() {
+    local resource_type="$1"
+    local resource_name="$2"
+    local namespace="${3:-}"
+
+    if [ -n "$namespace" ]; then
+        KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" delete "$resource_type" "$resource_name" -n "$namespace" 2>/dev/null || true
+    else
+        KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" delete "$resource_type" "$resource_name" 2>/dev/null || true
+    fi
+}
+
+cleanup_kubernetes() {
+    local sa_name="consumer-${USERNAME}"
+    local secret_name="consumer-${USERNAME}-token"
+    local crb_name
+    local rb_name
+    local namespaces
+    local ns
+
+    # Check if ServiceAccount exists
+    if ! KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get serviceaccount "$sa_name" -n default > /dev/null 2>&1; then
+        info "ServiceAccount '${sa_name}' does not exist — nothing to clean up in Kubernetes."
+        return
+    fi
+
+    # Delete ClusterRoleBindings for this consumer
+    info "Removing ClusterRoleBindings for '${USERNAME}'..."
+    for suffix in view custom; do
+        crb_name="consumer-${USERNAME}-${suffix}"
+        if KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get clusterrolebinding "$crb_name" > /dev/null 2>&1; then
+            _delete_k8s_resource clusterrolebinding "$crb_name"
+            info "Deleted ClusterRoleBinding '${crb_name}'."
+        fi
+    done
+
+    # Delete RoleBindings for this consumer (in any namespace)
+    info "Removing RoleBindings for '${USERNAME}'..."
+    for suffix in edit admin view; do
+        rb_name="consumer-${USERNAME}-${suffix}"
+        # Find namespaces where this RoleBinding exists
+        namespaces=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get rolebinding --all-namespaces \
+            -o jsonpath='{range .items[?(@.metadata.name=="'"${rb_name}"'")]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null || echo "")
+        if [ -n "$namespaces" ]; then
+            for ns in $namespaces; do
+                [ -n "$ns" ] || continue
+                _delete_k8s_resource rolebinding "$rb_name" "$ns"
+                info "Deleted RoleBinding '${rb_name}' in namespace '${ns}'."
+            done
+        fi
+    done
+
+    # Delete token Secret
+    info "Removing token Secret '${secret_name}'..."
+    _delete_k8s_resource secret "$secret_name" default
+    info "Deleted Secret '${secret_name}'."
+
+    # Delete ServiceAccount
+    info "Removing ServiceAccount '${sa_name}'..."
+    _delete_k8s_resource serviceaccount "$sa_name" default
+    success "Deleted ServiceAccount '${sa_name}'."
+}
+
+# -----------------------------------------------------------------------------
+# Clean up filesystem
+# -----------------------------------------------------------------------------
+
+cleanup_filesystem() {
+    if [ "$USER_EXISTS" != "true" ]; then
+        return
+    fi
+
+    local user_home
+    user_home=$(getent passwd "$USERNAME" | cut -d: -f6)
+    local kubeconfig_path="${user_home}/.kube/config"
+    local kube_dir="${user_home}/.kube"
+
+    # Remove kubeconfig
+    if [ -f "$kubeconfig_path" ]; then
+        rm -f "$kubeconfig_path"
+        success "Removed kubeconfig at ${kubeconfig_path}."
+    else
+        info "No kubeconfig found at ${kubeconfig_path}."
+    fi
+
+    # Remove .kube directory if empty
+    if [ -d "$kube_dir" ]; then
+        if [ -z "$(ls -A "$kube_dir" 2>/dev/null)" ]; then
+            rmdir "$kube_dir" 2>/dev/null || true
+            info "Removed empty directory ${kube_dir}."
+        fi
+    fi
+
+    # Optionally remove from baize-consumers group
+    if [ "$REMOVE_GROUP" = "true" ]; then
+        if id -nG "$USERNAME" 2>/dev/null | grep -qw "$CONSUMERS_GROUP"; then
+            gpasswd -d "$USERNAME" "$CONSUMERS_GROUP" 2>/dev/null || true
+            success "Removed '${USERNAME}' from '${CONSUMERS_GROUP}' group."
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Print summary
+# -----------------------------------------------------------------------------
+
+print_summary() {
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  Consumer '${USERNAME}' deprovisioned                      ║"
+    echo "║                                                             ║"
+    echo "║  Kubernetes resources and kubeconfig have been removed.    ║"
+    echo "║                                                             ║"
+    echo "║  To re-provision later:                                    ║"
+    echo "║    sudo baize-kube-add-consumer ${USERNAME}                ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+    parse_args "$@"
+
+    if [ "$DRY_RUN" = "true" ]; then
+        info "DRY RUN — no changes will be made."
+        echo ""
+        echo "Would remove:"
+        echo "  ServiceAccount:      consumer-${USERNAME}"
+        echo "  Token Secret:        consumer-${USERNAME}-token"
+        echo "  RoleBindings:        consumer-${USERNAME}-edit, consumer-${USERNAME}-admin"
+        echo "  ClusterRoleBindings: consumer-${USERNAME}-view, consumer-${USERNAME}-custom"
+        echo "  Kubeconfig:          ~${USERNAME}/.kube/config"
+        if [ "$REMOVE_GROUP" = "true" ]; then
+            echo "  Group membership:    remove from ${CONSUMERS_GROUP}"
+        fi
+        exit 0
+    fi
+
+    require_root
+    validate
+
+    if [ "$CLUSTER_ACCESSIBLE" = "true" ]; then
+        cleanup_kubernetes
+    fi
+
+    cleanup_filesystem
+    print_summary
+}
+
+main "$@"

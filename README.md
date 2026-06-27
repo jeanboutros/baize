@@ -1,6 +1,6 @@
 # Bai Ze (白泽; pinyin: Báizé)
 
-A Debian package that provisions a rootless [minikube](https://minikube.sigs.k8s.io/) Kubernetes cluster on a Raspberry Pi 5 (arm64), owned by a dedicated locked service account (`baize`) and accessible to human users through a shared kubeconfig.
+A Debian package that provisions a rootless [minikube](https://minikube.sigs.k8s.io/) Kubernetes cluster on a Raspberry Pi 5 (arm64), owned by a dedicated locked service account (`baize`) and accessible to human users through per-user kubeconfigs with role-based access control.
 
 ---
 
@@ -13,6 +13,12 @@ Install the required system packages first:
 ```bash
 sudo apt update
 sudo apt install -y podman curl systemd
+```
+
+Consumer users (human users who will access the cluster) must have `sudo` access. The `sudo -u baize` pattern used for cluster administration requires the consumer to authenticate with their own password via sudo.
+
+```bash
+sudo usermod -aG sudo <username>
 ```
 
 ### Step 1 — Install the package
@@ -37,13 +43,19 @@ Reboot the Pi:
 sudo reboot
 ```
 
-### Step 3 — Re-run the installer after reboot
+### Step 3 — Reboot and let the installer complete automatically
+
+After reboot, a oneshot systemd service (`baize-kube-reboot.service`) runs automatically and completes the installation — provisioning the `baize` user, downloading binaries, starting the cluster, and writing the admin kubeconfig. No manual re-run of `dpkg -i` is needed.
+
+**Check that installation completed successfully:**
 
 ```bash
-sudo dpkg -i baize-kube_1.0_arm64.deb
+systemctl status baize-kube-reboot
+# Look for "Active: inactive (dead)" with no errors in the log output.
+# A successful run shows the service exited cleanly after completing all steps.
 ```
 
-If the cgroup controller was already active (or after the reboot), the installer completes fully — provisioning the `baize` user, downloading binaries, starting the cluster, and writing the shared kubeconfig.
+If the cgroup controller was already active during the initial install, the installer completes fully in a single pass — no reboot or service is needed.
 
 ### Step 4 — Verify the installation
 
@@ -63,7 +75,7 @@ kubectl get nodes
 ```bash
 sudo apt install -y podman curl systemd
 sudo dpkg -i baize-kube_1.0_arm64.deb
-# reboot if prompted, then re-run the line above
+# reboot if prompted — installation completes automatically on next boot
 kubectl get nodes
 ```
 
@@ -94,14 +106,15 @@ brew install dpkg
 ```bash
 # 1. Edit scripts or docs as needed
 # 2. Sync docs into the package tree if you changed them
+mkdir -p debian/usr/share/doc/baize-kube/
 cp doc/*.md debian/usr/share/doc/baize-kube/
 
 # 3. Rebuild
 dpkg-deb --build debian baize-kube_1.0_arm64.deb
 
 # 4. Transfer to the Pi and install
-scp baize-kube_1.0_arm64.deb huyang@raspberrypi:~
-ssh huyang@raspberrypi "sudo dpkg -i baize-kube_1.0_arm64.deb"
+scp baize-kube_1.0_arm64.deb <user>@<host>:~
+ssh <user>@<host> "sudo dpkg -i baize-kube_1.0_arm64.deb"
 ```
 
 **To bump the version**, edit `debian/DEBIAN/control` first:
@@ -128,6 +141,7 @@ dpkg-deb --build debian baize-kube_1.1_arm64.deb
 | [doc/04-architecture.md](doc/04-architecture.md) | How this package is structured and why |
 | [doc/05-design-decisions.md](doc/05-design-decisions.md) | Every design decision and the reasoning behind it |
 | [doc/06-operations.md](doc/06-operations.md) | Day-to-day operations, troubleshooting, and uninstall |
+| [doc/07-installation.md](doc/07-installation.md) | Detailed installation guide with prerequisites, step-by-step instructions, and troubleshooting |
 
 ---
 

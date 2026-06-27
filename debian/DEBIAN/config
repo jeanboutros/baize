@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+# debconf config script for baize-kube
+# Sources debconf library and asks the consumer question
+
+. /usr/share/debconf/confmodule
+
+# Only ask if no config file exists
+if [ ! -s /etc/baize-kube/consumers.conf ]; then
+    db_input high baize-kube/consumers || true
+    db_go || true
+fi

@@ -9,23 +9,25 @@ set -euo pipefail
 # =============================================================================
 
 BAIZE_USER="baize"
+ADMINS_GROUP="baize-admins"
 CONSUMERS_GROUP="baize-consumers"
 BAIZE_HOME="/home/${BAIZE_USER}"
-KUBECONFIG_SHARED_DIR="/etc/baize-kube"
+KUBECONFIG_DIR="/etc/baize-kube"
 DELEGATE_CONF="/etc/systemd/system/user@.service.d/delegate.conf"
 MINIKUBE_BIN="/usr/local/bin/minikube"
 KUBECTL_BIN="/usr/local/bin/kubectl"
 PROFILE_SNIPPET="/etc/profile.d/baize-kube.sh"
+MANAGEMENT_SCRIPTS="baize-kube-add-consumer baize-kube-remove-consumer baize-kube-list-consumers baize-kube-update-kubeconfig"
 
 info()    { echo "[baize-kube] INFO:  $*"; }
 success() { echo "[baize-kube] OK:    $*"; }
 warn()    { echo "[baize-kube] WARN:  $*"; }
 
 # Only run full cleanup on 'remove' or 'purge', not on upgrade
-ACTION="${1:-}"
-if [ "$ACTION" != "remove" ] && [ "$ACTION" != "purge" ]; then
-    exit 0
-fi
+case "${1:-}" in
+    remove|purge) ;;
+    *) exit 0 ;;
+esac
 
 # -----------------------------------------------------------------------------
 # 1. Stop and disable minikube user service
@@ -83,12 +85,12 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 5. Remove shared kubeconfig and config directory
+# 5. Remove kubeconfig directory
 # -----------------------------------------------------------------------------
 
-info "Removing shared kubeconfig directory..."
-rm -rf "$KUBECONFIG_SHARED_DIR"
-success "Removed ${KUBECONFIG_SHARED_DIR}."
+info "Removing kubeconfig directory..."
+rm -rf "$KUBECONFIG_DIR"
+success "Removed ${KUBECONFIG_DIR}."
 
 # -----------------------------------------------------------------------------
 # 6. Remove binaries
@@ -118,7 +120,47 @@ rm -f "$PROFILE_SNIPPET"
 success "Profile snippet removed."
 
 # -----------------------------------------------------------------------------
-# 9. Note about cmdline.txt
+# 8b. Remove management scripts
+# -----------------------------------------------------------------------------
+
+info "Removing management scripts..."
+for script in $MANAGEMENT_SCRIPTS; do
+    if [ -f "/usr/local/bin/${script}" ]; then
+        rm -f "/usr/local/bin/${script}"
+        info "Removed /usr/local/bin/${script}."
+    fi
+done
+success "Management scripts removed."
+
+# -----------------------------------------------------------------------------
+# 8c. Remove baize-admins group
+# -----------------------------------------------------------------------------
+
+info "Removing group '${ADMINS_GROUP}'..."
+if getent group "$ADMINS_GROUP" > /dev/null 2>&1; then
+    groupdel "$ADMINS_GROUP" 2>/dev/null || true
+    success "Group '${ADMINS_GROUP}' removed."
+else
+    info "Group '${ADMINS_GROUP}' does not exist — skipping."
+fi
+
+# -----------------------------------------------------------------------------
+# 9. Remove post-reboot trigger artifacts
+# -----------------------------------------------------------------------------
+
+info "Removing post-reboot trigger artifacts..."
+systemctl disable baize-kube-reboot.service 2>/dev/null || true
+rm -f /etc/systemd/system/baize-kube-reboot.service
+rm -f /var/lib/baize-kube/needs-reboot
+rm -f /usr/lib/baize-kube/complete-install
+rm -f /usr/lib/baize-kube/baize-kube-reboot.service
+rmdir /var/lib/baize-kube 2>/dev/null || true
+rmdir /usr/lib/baize-kube 2>/dev/null || true
+systemctl daemon-reload
+success "Post-reboot trigger artifacts removed."
+
+# -----------------------------------------------------------------------------
+# 10. Note about cmdline.txt
 # -----------------------------------------------------------------------------
 
 echo ""

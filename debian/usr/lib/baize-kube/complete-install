@@ -1,0 +1,44 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# baize-kube complete-install
+# Completes baize-kube installation after reboot.
+# Called by baize-kube-reboot.service on first boot after cmdline.txt patch.
+# =============================================================================
+
+LOG_TAG="baize-kube-reboot"
+
+info()  { echo "[${LOG_TAG}] INFO:  $*"; }
+fail()  { echo "[${LOG_TAG}] ERROR: $*" >&2; exit 1; }
+
+# -----------------------------------------------------------------------------
+# 1. Verify cgroup memory controller is now active
+# -----------------------------------------------------------------------------
+
+CONTROLLERS=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || echo "")
+if ! echo "$CONTROLLERS" | grep -qw "memory"; then
+    fail "cgroup memory controller still not active after reboot. Check /boot/firmware/cmdline.txt."
+fi
+
+info "cgroup memory controller confirmed active."
+
+# -----------------------------------------------------------------------------
+# 2. Complete the deferred package configuration
+# -----------------------------------------------------------------------------
+
+info "Completing baize-kube installation..."
+dpkg --configure baize-kube || fail "dpkg --configure baize-kube failed."
+
+info "Installation complete. Disabling reboot service..."
+
+# -----------------------------------------------------------------------------
+# 3. Clean up: disable and remove the oneshot service
+# -----------------------------------------------------------------------------
+
+systemctl disable baize-kube-reboot.service
+rm -f /etc/systemd/system/baize-kube-reboot.service
+rm -f /var/lib/baize-kube/needs-reboot
+systemctl daemon-reload
+
+info "Reboot service cleaned up. Cluster should be running."

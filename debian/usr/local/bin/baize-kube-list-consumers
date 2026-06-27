@@ -1,0 +1,177 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# baize-kube-list-consumers — List provisioned Kubernetes consumer users
+#
+# Queries Kubernetes for all consumer-* ServiceAccounts and their
+# associated RoleBindings/ClusterRoleBindings.
+#
+# Usage:
+#   baize-kube-list-consumers
+# =============================================================================
+
+ADMIN_KUBECONFIG="/etc/baize-kube/admin-kubeconfig"
+KUBECTL="/usr/local/bin/kubectl"
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+info()    { echo "[baize-kube] INFO:  $*"; }
+warn()    { echo "[baize-kube] WARN:  $*"; }
+fail()    { echo "[baize-kube] ERROR: $*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: baize-kube-list-consumers
+
+List all provisioned consumer users with their roles and kubeconfig paths.
+EOF
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+
+validate() {
+    # Check admin kubeconfig exists
+    if [ ! -r "$ADMIN_KUBECONFIG" ]; then
+        fail "Admin kubeconfig not found at ${ADMIN_KUBECONFIG}. Is baize-kube installed?"
+    fi
+
+    # Check kubectl exists
+    if [ ! -x "$KUBECTL" ]; then
+        fail "kubectl not found at ${KUBECTL}. Is baize-kube installed?"
+    fi
+
+    # Check cluster is running
+    if ! KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get nodes --request-timeout=5s > /dev/null 2>&1; then
+        fail "Cannot reach the Kubernetes cluster. Is minikube running?"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Get binding info for a ServiceAccount
+# -----------------------------------------------------------------------------
+
+get_binding_info() {
+    local sa_name="$1"
+    local username="${sa_name#consumer-}"
+    local role=""
+    local scope=""
+    local namespace=""
+    local crb_view="consumer-${username}-view"
+    local crb_custom="consumer-${username}-custom"
+    local rb_name
+    local found_ns
+    local suffix
+
+    # Check ClusterRoleBindings
+    if KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get clusterrolebinding "$crb_view" > /dev/null 2>&1; then
+        role="view"
+        scope="cluster"
+    elif KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get clusterrolebinding "$crb_custom" > /dev/null 2>&1; then
+        role=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get clusterrolebinding "$crb_custom" \
+            -o jsonpath='{.roleRef.name}' 2>/dev/null || echo "custom")
+        scope="cluster"
+    fi
+
+    # Check RoleBindings (if no ClusterRoleBinding found)
+    if [ -z "$role" ]; then
+        for suffix in edit admin view; do
+            rb_name="consumer-${username}-${suffix}"
+            # Search all namespaces for this RoleBinding
+            found_ns=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get rolebinding --all-namespaces \
+                -o jsonpath='{range .items[?(@.metadata.name=="'"${rb_name}"'")]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null || echo "")
+            if [ -n "$found_ns" ]; then
+                role="$suffix"
+                scope="namespace"
+                namespace=$(echo "$found_ns" | head -1)
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$role" ]; then
+        role="(no binding)"
+        scope="—"
+        namespace="—"
+    fi
+
+    if [ "$scope" = "cluster" ]; then
+        namespace="(cluster)"
+    fi
+
+    echo "${username}|${role}|${namespace}"
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+    if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+        usage
+    fi
+
+    validate
+
+    # Get all consumer ServiceAccounts
+    local sas
+    sas=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get serviceaccounts -n default \
+        -o jsonpath='{range .items[?(@.metadata.name=="/^consumer-/")]}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+
+    # Fallback: if jsonpath filter doesn't work, get all and filter with grep
+    if [ -z "$sas" ]; then
+        sas=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get serviceaccounts -n default \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep '^consumer-' || echo "")
+    fi
+
+    if [ -z "$sas" ]; then
+        echo "No consumer users are provisioned."
+        echo ""
+        echo "To provision a consumer:"
+        echo "  sudo baize-kube-add-consumer <username>"
+        exit 0
+    fi
+
+    # Print header
+    printf "%-20s %-12s %-20s %s\n" "USERNAME" "ROLE" "NAMESPACE" "KUBECONFIG"
+    printf "%-20s %-12s %-20s %s\n" "--------" "----" "---------" "----------"
+
+    # Print each consumer
+    local sa_name
+    local info_line
+    local username
+    local role
+    local namespace
+    local kubeconfig_path
+
+    for sa_name in $sas; do
+        [ -n "$sa_name" ] || continue
+        info_line=$(get_binding_info "$sa_name")
+        username=$(echo "$info_line" | cut -d'|' -f1)
+        role=$(echo "$info_line" | cut -d'|' -f2)
+        namespace=$(echo "$info_line" | cut -d'|' -f3)
+
+        # Determine kubeconfig path
+        if id "$username" > /dev/null 2>&1; then
+            kubeconfig_path="$(getent passwd "$username" | cut -d: -f6)/.kube/config"
+            if [ ! -f "$kubeconfig_path" ]; then
+                kubeconfig_path="(not found)"
+            fi
+        else
+            kubeconfig_path="(user deleted)"
+        fi
+
+        printf "%-20s %-12s %-20s %s\n" "$username" "$role" "$namespace" "$kubeconfig_path"
+    done
+
+    echo ""
+    echo "To verify a consumer's effective permissions:"
+    echo "  kubectl auth can-i --list --as=system:serviceaccount:default:consumer-<username>"
+}
+
+main "$@"

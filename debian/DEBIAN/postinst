@@ -8,9 +8,10 @@ set -euo pipefail
 
 BAIZE_USER="baize"
 BAIZE_GROUP="baize"
+ADMINS_GROUP="baize-admins"
 CONSUMERS_GROUP="baize-consumers"
 BAIZE_HOME="/home/${BAIZE_USER}"
-KUBECONFIG_SHARED="/etc/baize-kube/kubeconfig"
+ADMIN_KUBECONFIG="/etc/baize-kube/admin-kubeconfig"
 CMDLINE_FILE="/boot/firmware/cmdline.txt"
 DELEGATE_CONF="/etc/systemd/system/user@.service.d/delegate.conf"
 MINIKUBE_BIN="/usr/local/bin/minikube"
@@ -18,10 +19,15 @@ KUBECTL_BIN="/usr/local/bin/kubectl"
 MINIKUBE_SERVICE_DIR="${BAIZE_HOME}/.config/systemd/user"
 MINIKUBE_SERVICE="${MINIKUBE_SERVICE_DIR}/minikube.service"
 DOC_DIR="/usr/share/doc/baize-kube"
+CONSUMERS_CONF="/etc/baize-kube/consumers.conf"
+REBOOT_SERVICE_SRC="/usr/lib/baize-kube/baize-kube-reboot.service"
+REBOOT_SERVICE_DST="/etc/systemd/system/baize-kube-reboot.service"
+REBOOT_FLAG="/var/lib/baize-kube/needs-reboot"
+REBOOT_FLAG_DIR="/var/lib/baize-kube"
 
 ARCH="arm64"
-MINIKUBE_URL="https://storage.googleapis.com/minikube/releases/latest/minikube-linux-${ARCH}"
-KUBECTL_URL="https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
+MINIKUBE_VERSION="v1.34.0"
+KUBECTL_VERSION="v1.31.0"  # Pinned for reproducibility; update with minikube version
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -75,26 +81,40 @@ check_and_patch_cgroup() {
     else
         info "Patching ${CMDLINE_FILE} to enable memory cgroup..."
         # Must remain a single line
-        cp "$CMDLINE_FILE" "${CMDLINE_FILE}.bak-baize-kube"
+        # Only create backup if it doesn't already exist
+        [ -f "${CMDLINE_FILE}.bak-baize-kube" ] || cp "$CMDLINE_FILE" "${CMDLINE_FILE}.bak-baize-kube"
         echo "${CMDLINE} cgroup_memory=1 cgroup_enable=memory" > "$CMDLINE_FILE"
-        success "Patched ${CMDLINE_FILE}. A reboot is required before continuing."
-        echo ""
-        echo "╔══════════════════════════════════════════════════════════════╗"
-        echo "║  REBOOT REQUIRED                                            ║"
-        echo "║                                                             ║"
-        echo "║  The kernel boot parameters have been updated to enable     ║"
-        echo "║  the cgroup memory controller, which is required for        ║"
-        echo "║  rootless Podman to enforce memory limits on containers.    ║"
-        echo "║                                                             ║"
-        echo "║  Please reboot now:                                         ║"
-        echo "║    sudo reboot                                              ║"
-        echo "║                                                             ║"
-        echo "║  After reboot, re-run the installer:                        ║"
-        echo "║    sudo dpkg -i baize-kube_1.0_arm64.deb                   ║"
-        echo "╚══════════════════════════════════════════════════════════════╝"
-        echo ""
-        exit 0  # Exit cleanly — installer must be re-run after reboot
+        success "Patched ${CMDLINE_FILE}."
     fi
+
+    # Install post-reboot trigger: flag file + oneshot systemd service
+    info "Installing post-reboot trigger..."
+
+    mkdir -p "$REBOOT_FLAG_DIR"
+    touch "$REBOOT_FLAG"
+
+    cp "$REBOOT_SERVICE_SRC" "$REBOOT_SERVICE_DST"
+    systemctl daemon-reload
+    systemctl enable baize-kube-reboot.service
+
+    success "Post-reboot trigger installed."
+
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  REBOOT REQUIRED                                            ║"
+    echo "║                                                             ║"
+    echo "║  The kernel boot parameters have been updated to enable     ║"
+    echo "║  the cgroup memory controller, which is required for        ║"
+    echo "║  rootless Podman to enforce memory limits on containers.    ║"
+    echo "║                                                             ║"
+    echo "║  Please reboot now:                                         ║"
+    echo "║    sudo reboot                                              ║"
+    echo "║                                                             ║"
+    echo "║  Installation will complete automatically on next boot.    ║"
+    echo "║  No manual re-run of dpkg is required.                     ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    exit 1  # Non-zero exit so dpkg leaves package Half-Configured
 }
 
 # -----------------------------------------------------------------------------
@@ -119,7 +139,15 @@ EOF
 provision_user() {
     info "Provisioning user and groups..."
 
-    # baize-consumers group for huyang and others to read the kubeconfig
+    # baize-admins group for cluster administrators
+    if ! getent group "$ADMINS_GROUP" > /dev/null 2>&1; then
+        groupadd --system "$ADMINS_GROUP"
+        success "Group '${ADMINS_GROUP}' created."
+    else
+        info "Group '${ADMINS_GROUP}' already exists."
+    fi
+
+    # baize-consumers group for human users to be provisioned
     if ! getent group "$CONSUMERS_GROUP" > /dev/null 2>&1; then
         groupadd --system "$CONSUMERS_GROUP"
         success "Group '${CONSUMERS_GROUP}' created."
@@ -166,44 +194,163 @@ provision_user() {
 }
 
 # -----------------------------------------------------------------------------
-# 5. Add consumer users to baize-consumers group
+# 5. Consumer selection — config file or debconf, never "all users"
 # -----------------------------------------------------------------------------
 
-add_consumers() {
-    info "Adding consumer users to '${CONSUMERS_GROUP}'..."
+consumer_selection() {
+    info "Selecting consumer users for '${CONSUMERS_GROUP}'..."
 
-    # Add all non-system human users (UID >= 1000, not baize itself)
-    while IFS=: read -r username _ uid _; do
-        if [ "$uid" -ge 1000 ] && [ "$username" != "$BAIZE_USER" ]; then
-            if id "$username" > /dev/null 2>&1; then
-                usermod -aG "$CONSUMERS_GROUP" "$username"
-                success "Added '${username}' to '${CONSUMERS_GROUP}'."
-            fi
+    local consumers=""
+    local first_admin=""
+    local username
+    local added=0
+    local skipped=0
+
+    # Priority 1: Config file
+    if [ -s "$CONSUMERS_CONF" ]; then
+        info "Reading consumers from ${CONSUMERS_CONF}..."
+        # Read non-empty, non-comment lines
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Strip inline comments and trim whitespace
+            line="${line%%#*}"
+            line="$(echo "$line" | xargs)"
+            [ -n "$line" ] || continue
+            consumers="${consumers}${consumers:+ }${line}"
+        done < "$CONSUMERS_CONF"
+    fi
+
+    # Priority 2: debconf (interactive only)
+    if [ -z "$consumers" ]; then
+        if [ -f /usr/share/debconf/confmodule ]; then
+            . /usr/share/debconf/confmodule
+            db_get baize-kube/consumers || true
+            consumers="$(echo "$RET" | xargs)"
         fi
-    done < /etc/passwd
+    fi
+
+    # Priority 3: Fail — no fallback to "all users"
+    if [ -z "$consumers" ]; then
+        if [ -n "${DEBIAN_FRONTEND:-}" ] && [ "$DEBIAN_FRONTEND" = "noninteractive" ]; then
+            fail "No ${CONSUMERS_CONF} found and running non-interactively. Create ${CONSUMERS_CONF} with one username per line for unattended installs."
+        fi
+        fail "No consumers specified. Create ${CONSUMERS_CONF} or re-run interactively."
+    fi
+
+    # Validate and add each consumer
+    for username in $consumers; do
+        # Skip the baize user itself
+        if [ "$username" = "$BAIZE_USER" ]; then
+            info "Skipping '${BAIZE_USER}' (cluster owner, not a consumer)."
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        if id "$username" > /dev/null 2>&1; then
+            usermod -aG "$CONSUMERS_GROUP" "$username"
+            success "Added '${username}' to '${CONSUMERS_GROUP}'."
+
+            # First valid user becomes the initial admin
+            if [ -z "$first_admin" ]; then
+                first_admin="$username"
+            fi
+
+            added=$((added + 1))
+        else
+            warn "User '${username}' does not exist on this system — skipping."
+            skipped=$((skipped + 1))
+        fi
+    done
+
+    if [ "$added" -eq 0 ] && [ "$skipped" -gt 0 ]; then
+        fail "No valid consumer users were added. Check ${CONSUMERS_CONF} or re-run interactively."
+    fi
+
+    # Add the first valid user to baize-admins group
+    if [ -n "$first_admin" ]; then
+        usermod -aG "$ADMINS_GROUP" "$first_admin"
+        success "Added '${first_admin}' to '${ADMINS_GROUP}' (initial cluster admin)."
+    fi
+
+    info "Consumer selection complete: ${added} added, ${skipped} skipped."
 }
 
 # -----------------------------------------------------------------------------
 # 6. Download minikube and kubectl binaries
 # -----------------------------------------------------------------------------
 
+# Helper for retryable downloads
+download_with_retry() {
+    local url="$1"
+    local output="$2"
+    local description="$3"
+    local max_retries=3
+    local attempt=1
+
+    while [ $attempt -le $max_retries ]; do
+        if curl -fsSL --max-time 120 -o "$output" "$url"; then
+            return 0
+        fi
+        warn "Download attempt ${attempt}/${max_retries} failed for ${description}. Retrying in 5s..."
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
 download_binaries() {
-    info "Downloading minikube (latest, ${ARCH})..."
-    curl -fsSL --max-time 120 -o "$MINIKUBE_BIN" "$MINIKUBE_URL" \
+    info "Downloading minikube ${MINIKUBE_VERSION} (${ARCH})..."
+
+    MINIKUBE_URL="https://storage.googleapis.com/minikube/releases/${MINIKUBE_VERSION}/minikube-linux-${ARCH}"
+    MINIKUBE_SHA_URL="${MINIKUBE_URL}.sha256"
+
+    # Download binary
+    download_with_retry "$MINIKUBE_URL" "${MINIKUBE_BIN}.tmp" "minikube" \
         || fail "Failed to download minikube from ${MINIKUBE_URL}."
+
+    # Download and verify checksum
+    info "Verifying minikube checksum..."
+    curl -fsSL --max-time 10 -o "${MINIKUBE_BIN}.sha256" "$MINIKUBE_SHA_URL" \
+        || fail "Failed to download minikube checksum."
+
+    # The .sha256 file contains "<hash>  minikube-linux-arm64" — we need to check against our tmp file
+    EXPECTED=$(awk '{print $1}' "${MINIKUBE_BIN}.sha256")
+    ACTUAL=$(sha256sum "${MINIKUBE_BIN}.tmp" | awk '{print $1}')
+
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+        rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
+        fail "minikube checksum verification FAILED. Expected: ${EXPECTED}, Got: ${ACTUAL}"
+    fi
+
+    mv "${MINIKUBE_BIN}.tmp" "$MINIKUBE_BIN"
     chmod +x "$MINIKUBE_BIN"
-    success "minikube installed at ${MINIKUBE_BIN}."
+    rm -f "${MINIKUBE_BIN}.sha256"
+    success "minikube ${MINIKUBE_VERSION} installed and verified at ${MINIKUBE_BIN}."
 
-    info "Resolving latest kubectl version..."
-    K8S_VERSION=$(curl -fsSL --max-time 10 https://dl.k8s.io/release/stable.txt) \
-        || fail "Failed to resolve latest kubectl version."
-    KUBECTL_VERSIONED_URL="https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/${ARCH}/kubectl"
+    # kubectl — same pattern, using pinned version
+    info "Downloading kubectl ${KUBECTL_VERSION} (${ARCH})..."
 
-    info "Downloading kubectl ${K8S_VERSION} (${ARCH})..."
-    curl -fsSL --max-time 120 -o "$KUBECTL_BIN" "$KUBECTL_VERSIONED_URL" \
-        || fail "Failed to download kubectl from ${KUBECTL_VERSIONED_URL}."
+    KUBECTL_URL="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
+    KUBECTL_SHA_URL="${KUBECTL_URL}.sha256"
+
+    download_with_retry "$KUBECTL_URL" "${KUBECTL_BIN}.tmp" "kubectl" \
+        || fail "Failed to download kubectl from ${KUBECTL_URL}."
+
+    info "Verifying kubectl checksum..."
+    curl -fsSL --max-time 10 -o "${KUBECTL_BIN}.sha256" "$KUBECTL_SHA_URL" \
+        || fail "Failed to download kubectl checksum."
+
+    EXPECTED=$(awk '{print $1}' "${KUBECTL_BIN}.sha256")
+    ACTUAL=$(sha256sum "${KUBECTL_BIN}.tmp" | awk '{print $1}')
+
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+        rm -f "${KUBECTL_BIN}.tmp" "${KUBECTL_BIN}.sha256"
+        fail "kubectl checksum verification FAILED. Expected: ${EXPECTED}, Got: ${ACTUAL}"
+    fi
+
+    mv "${KUBECTL_BIN}.tmp" "$KUBECTL_BIN"
     chmod +x "$KUBECTL_BIN"
-    success "kubectl ${K8S_VERSION} installed at ${KUBECTL_BIN}."
+    rm -f "${KUBECTL_BIN}.sha256"
+    success "kubectl ${KUBECTL_VERSION} installed and verified at ${KUBECTL_BIN}."
 }
 
 # -----------------------------------------------------------------------------
@@ -214,6 +361,27 @@ enable_lingering() {
     info "Enabling systemd lingering for '${BAIZE_USER}'..."
     loginctl enable-linger "$BAIZE_USER"
     success "Lingering enabled — baize user services will start at boot."
+}
+
+# -----------------------------------------------------------------------------
+# 7b. Install management scripts
+# -----------------------------------------------------------------------------
+
+install_management_scripts() {
+    info "Ensuring management scripts are executable..."
+
+    local scripts="baize-kube-add-consumer baize-kube-remove-consumer baize-kube-list-consumers baize-kube-update-kubeconfig"
+    local script
+
+    for script in $scripts; do
+        if [ -f "/usr/local/bin/${script}" ]; then
+            chmod 755 "/usr/local/bin/${script}"
+            chown root:root "/usr/local/bin/${script}"
+            success "Verified ${script}."
+        else
+            warn "Management script '${script}' not found at /usr/local/bin/${script} — skipping."
+        fi
+    done
 }
 
 # -----------------------------------------------------------------------------
@@ -251,13 +419,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=exec
+Type=oneshot
+RemainAfterExit=yes
 Environment=HOME=${BAIZE_HOME}
 Environment=MINIKUBE_ROOTLESS=true
 ExecStart=${MINIKUBE_BIN} start --driver=podman --no-vtx-check
 ExecStop=${MINIKUBE_BIN} stop
-Restart=on-failure
-RestartSec=10s
 TimeoutStartSec=300
 
 [Install]
@@ -292,62 +459,91 @@ start_cluster() {
     " || fail "minikube failed to start. Check: sudo -u baize minikube logs"
 
     success "minikube cluster started."
+
+    # Verify the API server is responding before proceeding
+    info "Verifying cluster is healthy..."
+    for i in $(seq 1 30); do
+        if runuser -l "$BAIZE_USER" -s /bin/bash -c "
+            export HOME=${BAIZE_HOME}
+            export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+            export MINIKUBE_ROOTLESS=true
+            ${KUBECTL_BIN} get nodes --request-timeout=5s 2>/dev/null
+        "; then
+            success "Cluster API server is responding."
+            return 0
+        fi
+        sleep 2
+    done
+    fail "Cluster started but API server did not become healthy within 60 seconds."
 }
 
 # -----------------------------------------------------------------------------
-# 11. Provision shared kubeconfig for consumers
+# 11. Provision admin kubeconfig for baize-admins group
 # -----------------------------------------------------------------------------
 
 provision_kubeconfig() {
-    info "Provisioning shared kubeconfig for '${CONSUMERS_GROUP}'..."
+    info "Provisioning admin kubeconfig for '${ADMINS_GROUP}'..."
 
     mkdir -p /etc/baize-kube
-    chown "root:${CONSUMERS_GROUP}" /etc/baize-kube
+    chown "root:${ADMINS_GROUP}" /etc/baize-kube
     chmod 750 /etc/baize-kube
 
     runuser -l "$BAIZE_USER" -s /bin/bash -c "
         export HOME=${BAIZE_HOME}
         export XDG_RUNTIME_DIR=/run/user/\$(id -u)
         export MINIKUBE_ROOTLESS=true
-        ${MINIKUBE_BIN} kubectl -- config view --flatten > ${KUBECONFIG_SHARED}
-    " || fail "Failed to export kubeconfig."
+        ${MINIKUBE_BIN} kubectl -- config view --flatten > ${ADMIN_KUBECONFIG}
+    " || fail "Failed to export admin kubeconfig."
 
-    chown "root:${CONSUMERS_GROUP}" "$KUBECONFIG_SHARED"
-    chmod 640 "$KUBECONFIG_SHARED"
+    chown "root:${ADMINS_GROUP}" "$ADMIN_KUBECONFIG"
+    chmod 640 "$ADMIN_KUBECONFIG"
 
-    success "Shared kubeconfig written to ${KUBECONFIG_SHARED}."
-    success "Members of '${CONSUMERS_GROUP}' can access it with:"
-    success "  export KUBECONFIG=${KUBECONFIG_SHARED}"
+    success "Admin kubeconfig written to ${ADMIN_KUBECONFIG} (group: ${ADMINS_GROUP})."
+
+    # Consumer kubeconfigs are NOT created here.
+    # They are created on-demand by baize-kube-add-consumer.
+    info "Consumer kubeconfigs are created on-demand with: sudo baize-kube-add-consumer <username>"
 }
 
 # -----------------------------------------------------------------------------
-# 12. Shell profile hint for consumers
+# 12. Shell profile hint for admins
 # -----------------------------------------------------------------------------
 
 install_profile_hint() {
     PROFILE_SNIPPET="/etc/profile.d/baize-kube.sh"
-    cat > "$PROFILE_SNIPPET" <<EOF
-# baize-kube: set KUBECONFIG for members of ${CONSUMERS_GROUP}
-if id -nG "\$USER" 2>/dev/null | grep -qw "${CONSUMERS_GROUP}"; then
-    export KUBECONFIG=${KUBECONFIG_SHARED}
+    cat > "$PROFILE_SNIPPET" <<'PROFILEEOF'
+# baize-kube: set KUBECONFIG for cluster admins
+# Admins get full access via the admin kubeconfig.
+# Consumers use kubectl's default location (~/.kube/config).
+if id -nG "$USER" 2>/dev/null | grep -qw "baize-admins"; then
+    export KUBECONFIG=/etc/baize-kube/admin-kubeconfig
 fi
-EOF
+PROFILEEOF
     chmod 644 "$PROFILE_SNIPPET"
     success "Shell profile snippet installed at ${PROFILE_SNIPPET}."
-    success "KUBECONFIG will be auto-set for all members of '${CONSUMERS_GROUP}' on next login."
+    success "KUBECONFIG will be auto-set for members of '${ADMINS_GROUP}' on next login."
+    info "Consumers use kubectl's default location (~/.kube/config) — no env var needed."
 }
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
+# Only run full installation on 'configure'
+ACTION="${1:-}"
+if [ "$ACTION" != "configure" ] && [ -n "$ACTION" ]; then
+    # For abort-upgrade, abort-remove, etc. — nothing to do
+    exit 0
+fi
+
 require_root
 check_network
 check_and_patch_cgroup
 configure_cgroup_delegation
 provision_user
-add_consumers
+consumer_selection
 download_binaries
+install_management_scripts
 enable_lingering
 configure_minikube
 install_service
@@ -360,11 +556,18 @@ echo "╔═══════════════════════�
 echo "║  baize-kube installation complete                           ║"
 echo "║                                                             ║"
 echo "║  Cluster owner:  baize  (locked, no interactive login)     ║"
-echo "║  Consumers:      members of 'baize-consumers' group        ║"
-echo "║  Kubeconfig:     /etc/baize-kube/kubeconfig                ║"
+echo "║  Admins:         members of 'baize-admins' group           ║"
+echo "║  Consumers:      members of 'baize-consumers' group       ║"
+echo "║  Admin config:   /etc/baize-kube/admin-kubeconfig          ║"
 echo "║                                                             ║"
-echo "║  Log out and back in, then run:                            ║"
+echo "║  Admins: log out and back in, then run:                    ║"
 echo "║    kubectl get nodes                                        ║"
+echo "║                                                             ║"
+echo "║  To provision a consumer:                                   ║"
+echo "║    sudo baize-kube-add-consumer <username>                  ║"
+echo "║                                                             ║"
+echo "║  To list provisioned consumers:                             ║"
+echo "║    baize-kube-list-consumers                                ║"
 echo "║                                                             ║"
 echo "║  To reconfigure minikube:                                   ║"
 echo "║    sudo -u baize minikube <command>                        ║"

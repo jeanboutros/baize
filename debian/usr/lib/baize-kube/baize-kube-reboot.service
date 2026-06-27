@@ -1,0 +1,14 @@
+[Unit]
+Description=Complete baize-kube installation after cgroup reboot
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/baize-kube/needs-reboot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/baize-kube/complete-install
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

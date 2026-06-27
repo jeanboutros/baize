@@ -1,0 +1,411 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# baize-kube-add-consumer — Provision a Kubernetes consumer user
+#
+# Creates a per-user ServiceAccount, token Secret, RBAC bindings, and
+# per-user kubeconfig at ~<username>/.kube/config.
+#
+# Usage:
+#   baize-kube-add-consumer <username> [OPTIONS]
+#
+# Options:
+#   --role <role>         Built-in ClusterRole: view, edit, admin (default: view)
+#   --namespace <ns>      Namespace for RoleBinding (required for --role edit|admin)
+#   --cluster-role <name> Custom ClusterRole name (overrides --role)
+#   --dry-run             Show what would be done without making changes
+#   --force               Overwrite existing kubeconfig if it exists
+#   -h, --help            Show this help message
+# =============================================================================
+
+ADMIN_KUBECONFIG="/etc/baize-kube/admin-kubeconfig"
+CONSUMERS_GROUP="baize-consumers"
+KUBECTL="/usr/local/bin/kubectl"
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+info()    { echo "[baize-kube] INFO:  $*"; }
+success() { echo "[baize-kube] OK:    $*"; }
+warn()    { echo "[baize-kube] WARN:  $*"; }
+fail()    { echo "[baize-kube] ERROR: $*" >&2; exit 1; }
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || fail "This script must be run as root (or via sudo)."
+}
+
+usage() {
+    cat <<EOF
+Usage: baize-kube-add-consumer <username> [OPTIONS]
+
+Provision a Kubernetes consumer user with their own ServiceAccount,
+RBAC bindings, and per-user kubeconfig at ~<username>/.kube/config.
+
+OPTIONS:
+  --role <role>         Built-in ClusterRole to bind (view, edit, admin)
+                        Default: view
+  --namespace <ns>      Namespace for RoleBinding (required for --role edit|admin)
+                        If omitted with --role view, creates a ClusterRoleBinding
+  --cluster-role <name> Custom ClusterRole name (overrides --role)
+  --dry-run             Show what would be done without making changes
+  --force               Overwrite existing kubeconfig if it exists
+  -h, --help            Show this help message
+
+EXAMPLES:
+  # Grant alice read-only access to all namespaces
+  sudo baize-kube-add-consumer alice
+
+  # Grant bob read-write access to the 'dev' namespace
+  sudo baize-kube-add-consumer bob --role edit --namespace dev
+
+  # Grant carol full admin access to the 'staging' namespace
+  sudo baize-kube-add-consumer carol --role admin --namespace staging
+
+  # Grant dave a custom ClusterRole
+  sudo baize-kube-add-consumer dave --cluster-role my-custom-role
+EOF
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Argument parsing
+# -----------------------------------------------------------------------------
+
+parse_args() {
+    USERNAME=""
+    ROLE="view"
+    NAMESPACE=""
+    CLUSTER_ROLE=""
+    DRY_RUN=false
+    FORCE=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage
+                ;;
+            --role)
+                ROLE="$2"
+                shift 2
+                ;;
+            --namespace)
+                NAMESPACE="$2"
+                shift 2
+                ;;
+            --cluster-role)
+                CLUSTER_ROLE="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --force)
+                FORCE=true
+                shift
+                ;;
+            -*)
+                fail "Unknown option: $1"
+                ;;
+            *)
+                if [ -z "$USERNAME" ]; then
+                    USERNAME="$1"
+                else
+                    fail "Unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$USERNAME" ]; then
+        fail "Username is required. See --help for usage."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+
+validate() {
+    # Check admin kubeconfig exists
+    if [ ! -r "$ADMIN_KUBECONFIG" ]; then
+        fail "Admin kubeconfig not found at ${ADMIN_KUBECONFIG}. Is baize-kube installed?"
+    fi
+
+    # Check kubectl exists
+    if [ ! -x "$KUBECTL" ]; then
+        fail "kubectl not found at ${KUBECTL}. Is baize-kube installed?"
+    fi
+
+    # Check user exists on system
+    if ! id "$USERNAME" > /dev/null 2>&1; then
+        fail "User '${USERNAME}' does not exist on this system."
+    fi
+
+    # Check user is in baize-consumers group
+    if ! id -nG "$USERNAME" 2>/dev/null | grep -qw "$CONSUMERS_GROUP"; then
+        fail "User '${USERNAME}' is not a member of '${CONSUMERS_GROUP}' group. Add them first: sudo usermod -aG ${CONSUMERS_GROUP} ${USERNAME}"
+    fi
+
+    # Check cluster is running
+    if ! KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get nodes --request-timeout=5s > /dev/null 2>&1; then
+        fail "Cannot reach the Kubernetes cluster. Is minikube running? Check: sudo -u baize systemctl --user status minikube"
+    fi
+
+    # Validate role
+    case "$ROLE" in
+        view|edit|admin) ;;
+        *) fail "Invalid --role '${ROLE}'. Must be one of: view, edit, admin." ;;
+    esac
+
+    # If role is edit or admin, namespace is required
+    if [ "$ROLE" = "edit" ] || [ "$ROLE" = "admin" ]; then
+        if [ -z "$NAMESPACE" ]; then
+            fail "--role ${ROLE} requires --namespace."
+        fi
+    fi
+
+    # If namespace is specified, verify it exists
+    if [ -n "$NAMESPACE" ]; then
+        if ! KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get namespace "$NAMESPACE" > /dev/null 2>&1; then
+            fail "Namespace '${NAMESPACE}' does not exist. Create it first: kubectl create namespace ${NAMESPACE}"
+        fi
+    fi
+
+    # If cluster-role is specified, verify it exists
+    if [ -n "$CLUSTER_ROLE" ]; then
+        if ! KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get clusterrole "$CLUSTER_ROLE" > /dev/null 2>&1; then
+            fail "ClusterRole '${CLUSTER_ROLE}' does not exist."
+        fi
+    fi
+
+    # Check if user is already provisioned
+    SA_NAME="consumer-${USERNAME}"
+    if KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get serviceaccount "$SA_NAME" -n default > /dev/null 2>&1; then
+        fail "ServiceAccount '${SA_NAME}' already exists. User '${USERNAME}' appears to be already provisioned. To re-provision, first run: sudo baize-kube-remove-consumer ${USERNAME}"
+    fi
+
+    # Check if kubeconfig already exists
+    USER_HOME=$(getent passwd "$USERNAME" | cut -d: -f6)
+    USER_KUBECONFIG="${USER_HOME}/.kube/config"
+    if [ -f "$USER_KUBECONFIG" ] && [ "$FORCE" != "true" ]; then
+        fail "Kubeconfig already exists at ${USER_KUBECONFIG}. Use --force to overwrite."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Determine RBAC binding type
+# -----------------------------------------------------------------------------
+
+determine_binding() {
+    # If --cluster-role is set, always use ClusterRoleBinding
+    if [ -n "$CLUSTER_ROLE" ]; then
+        BINDING_TYPE="clusterrolebinding"
+        BINDING_NAME="consumer-${USERNAME}-custom"
+        BINDING_ROLE="$CLUSTER_ROLE"
+        return
+    fi
+
+    # If --role is view and no --namespace, use ClusterRoleBinding
+    if [ "$ROLE" = "view" ] && [ -z "$NAMESPACE" ]; then
+        BINDING_TYPE="clusterrolebinding"
+        BINDING_NAME="consumer-${USERNAME}-view"
+        BINDING_ROLE="view"
+        return
+    fi
+
+    # Otherwise, use RoleBinding (namespace-scoped)
+    BINDING_TYPE="rolebinding"
+    BINDING_NAME="consumer-${USERNAME}-${ROLE}"
+    BINDING_ROLE="$ROLE"
+}
+
+# -----------------------------------------------------------------------------
+# Create Kubernetes resources
+# -----------------------------------------------------------------------------
+
+create_resources() {
+    local sa_name="consumer-${USERNAME}"
+    local secret_name="consumer-${USERNAME}-token"
+
+    info "Creating ServiceAccount '${sa_name}'..."
+    KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" create serviceaccount "$sa_name" -n default
+
+    info "Creating token Secret '${secret_name}'..."
+    KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${secret_name}
+  namespace: default
+  annotations:
+    kubernetes.io/service-account.name: ${sa_name}
+type: kubernetes.io/service-account-token
+EOF
+
+    # Wait for token to be populated
+    info "Waiting for token to be generated..."
+    local max_attempts=30
+    local attempt=1
+    local token=""
+    while [ $attempt -le $max_attempts ]; do
+        token=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get secret "$secret_name" -n default \
+            -o jsonpath='{.data.token}' 2>/dev/null || echo "")
+        if [ -n "$token" ]; then
+            break
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+
+    if [ -z "$token" ]; then
+        fail "Token was not generated within ${max_attempts} seconds. Check: kubectl describe secret ${secret_name} -n default"
+    fi
+    success "Token generated."
+
+    # Create RBAC binding
+    if [ "$BINDING_TYPE" = "clusterrolebinding" ]; then
+        info "Creating ClusterRoleBinding '${BINDING_NAME}' to '${BINDING_ROLE}'..."
+        KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" create clusterrolebinding "$BINDING_NAME" \
+            --clusterrole="$BINDING_ROLE" \
+            --serviceaccount="default:${sa_name}"
+    else
+        info "Creating RoleBinding '${BINDING_NAME}' to '${BINDING_ROLE}' in namespace '${NAMESPACE}'..."
+        KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" create rolebinding "$BINDING_NAME" \
+            --clusterrole="$BINDING_ROLE" \
+            --serviceaccount="default:${sa_name}" \
+            -n "$NAMESPACE"
+    fi
+
+    success "RBAC binding created."
+}
+
+# -----------------------------------------------------------------------------
+# Build kubeconfig
+# -----------------------------------------------------------------------------
+
+build_kubeconfig() {
+    local user_home
+    user_home=$(getent passwd "$USERNAME" | cut -d: -f6)
+    local kubeconfig_path="${user_home}/.kube/config"
+    local kube_dir="${user_home}/.kube"
+
+    info "Building kubeconfig for '${USERNAME}'..."
+
+    # Get API server URL and CA cert from admin kubeconfig
+    local server
+    server=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" config view --raw \
+        -o jsonpath='{.clusters[0].cluster.server}')
+    local ca_data
+    ca_data=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" config view --raw \
+        -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+
+    # Get token from Secret
+    local secret_name="consumer-${USERNAME}-token"
+    local token
+    token=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get secret "$secret_name" -n default \
+        -o jsonpath='{.data.token}')
+
+    # Create .kube directory
+    mkdir -p "$kube_dir"
+
+    # Write kubeconfig
+    cat > "$kubeconfig_path" <<YAMLEOF
+apiVersion: v1
+kind: Config
+current-context: baize-consumer
+contexts:
+- name: baize-consumer
+  context:
+    cluster: minikube
+    user: consumer-${USERNAME}
+clusters:
+- name: minikube
+  cluster:
+    certificate-authority-data: ${ca_data}
+    server: ${server}
+users:
+- name: consumer-${USERNAME}
+  user:
+    token: ${token}
+YAMLEOF
+
+    # Set ownership and permissions
+    chown "${USERNAME}:${USERNAME}" "$kubeconfig_path"
+    chmod 600 "$kubeconfig_path"
+    chown "${USERNAME}:${USERNAME}" "$kube_dir"
+    chmod 700 "$kube_dir"
+
+    success "Kubeconfig written to ${kubeconfig_path} (mode 600, owned by ${USERNAME})."
+}
+
+# -----------------------------------------------------------------------------
+# Print summary
+# -----------------------------------------------------------------------------
+
+print_summary() {
+    local sa_name="consumer-${USERNAME}"
+    local user_home
+    user_home=$(getent passwd "$USERNAME" | cut -d: -f6)
+
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  Consumer '${USERNAME}' provisioned                        ║"
+    echo "║                                                             ║"
+    echo "║  ServiceAccount:  ${sa_name}                               ║"
+    echo "║  Role:            ${BINDING_ROLE}                          ║"
+
+    if [ "$BINDING_TYPE" = "clusterrolebinding" ]; then
+        echo "║  Scope:           cluster-wide                             ║"
+    else
+        echo "║  Namespace:       ${NAMESPACE}                            ║"
+    fi
+
+    echo "║  Kubeconfig:      ${user_home}/.kube/config               ║"
+    echo "║                                                             ║"
+    echo "║  The user can now run kubectl commands directly.           ║"
+    echo "║  No KUBECONFIG env var needed (uses default location).     ║"
+    echo "║                                                             ║"
+    echo "║  To verify permissions:                                    ║"
+    echo "║    kubectl auth can-i --list \\                            ║"
+    echo "║      --as=system:serviceaccount:default:${sa_name}         ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+    parse_args "$@"
+
+    if [ "$DRY_RUN" = "true" ]; then
+        info "DRY RUN — no changes will be made."
+        determine_binding
+        echo ""
+        echo "Would create:"
+        echo "  ServiceAccount:      consumer-${USERNAME}"
+        echo "  Token Secret:        consumer-${USERNAME}-token"
+        echo "  Binding type:        ${BINDING_TYPE}"
+        echo "  Binding name:        ${BINDING_NAME}"
+        echo "  Role:                ${BINDING_ROLE}"
+        if [ "$BINDING_TYPE" = "rolebinding" ]; then
+            echo "  Namespace:           ${NAMESPACE}"
+        fi
+        echo "  Kubeconfig path:     ~${USERNAME}/.kube/config"
+        exit 0
+    fi
+
+    require_root
+    validate
+    determine_binding
+    create_resources
+    build_kubeconfig
+    print_summary
+}
+
+main "$@"

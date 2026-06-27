@@ -1,0 +1,12 @@
+Template: baize-kube/consumers
+Type: string
+Default:
+Description: Kubernetes cluster consumers
+ Which users should have access to the Kubernetes cluster?
+ .
+ Enter usernames separated by spaces. These users will be added
+ to the 'baize-consumers' group and will be able to access the
+ cluster once provisioned.
+ .
+ For unattended installs, create /etc/baize-kube/consumers.conf
+ with one username per line before running dpkg -i.
