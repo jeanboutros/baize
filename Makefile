@@ -18,7 +18,7 @@ build:
 	@# Inject version into control file (preserve original)
 	@cp debian/DEBIAN/control debian/DEBIAN/control.orig
 	@sed "s/^Version:.*/Version: $(VERSION)/" debian/DEBIAN/control.orig > debian/DEBIAN/control
-	dpkg-deb --build debian $(DEB)
+	dpkg-deb --build --root-owner-group debian $(DEB)
 	@# Restore original control file
 	@mv debian/DEBIAN/control.orig debian/DEBIAN/control
 	@echo "Built: $(DEB)"
