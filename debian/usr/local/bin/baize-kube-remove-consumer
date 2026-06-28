@@ -100,11 +100,27 @@ validate() {
         USER_EXISTS=true
     fi
 
-    # Check admin kubeconfig exists
+    # Check admin kubeconfig — attempt recovery if missing
     if [ ! -r "$ADMIN_KUBECONFIG" ]; then
-        warn "Admin kubeconfig not found at ${ADMIN_KUBECONFIG}. Skipping Kubernetes resource cleanup."
-        CLUSTER_ACCESSIBLE=false
-        return
+        # Check if minikube is running and try to regenerate
+        if command -v minikube > /dev/null 2>&1 && \
+           sudo -u baize minikube status 2>/dev/null | grep -q "Running"; then
+            info "Admin kubeconfig missing but cluster is running. Regenerating..."
+            sudo -u baize minikube kubectl -- config view --flatten 2>/dev/null | \
+                sudo tee "$ADMIN_KUBECONFIG" > /dev/null 2>&1 || true
+            if [ -f "$ADMIN_KUBECONFIG" ] && [ -s "$ADMIN_KUBECONFIG" ]; then
+                sudo chown "root:baize-admins" "$ADMIN_KUBECONFIG"
+                sudo chmod 640 "$ADMIN_KUBECONFIG"
+                success "Admin kubeconfig regenerated."
+            fi
+        fi
+
+        # If still missing after recovery attempt, skip Kubernetes cleanup gracefully
+        if [ ! -r "$ADMIN_KUBECONFIG" ]; then
+            warn "Admin kubeconfig not found at ${ADMIN_KUBECONFIG}. Skipping Kubernetes resource cleanup."
+            CLUSTER_ACCESSIBLE=false
+            return
+        fi
     fi
 
     # Check kubectl exists
