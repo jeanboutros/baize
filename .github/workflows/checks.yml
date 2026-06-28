@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Run shellcheck
-        uses: ludeeus/action-shellcheck@v2.0.0
+        uses: ludeeus/action-shellcheck@master
         with:
           scandir: './debian'
           format: tty
