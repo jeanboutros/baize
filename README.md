@@ -91,34 +91,65 @@ sudo -u baize minikube <command>
 
 ---
 
-## Rebuilding the package
+## Building and Installing
 
 The `.deb` is built from the `debian/` directory using `dpkg-deb`. No compiler is needed — the package contains only shell scripts and documentation.
 
-**Prerequisites on the build machine:**
+### Prerequisites
 
 ```bash
 # Raspberry Pi OS / Debian
-sudo apt install dpkg-dev
+sudo apt install dpkg-dev shellcheck lintian bats
 
-# macOS
+# macOS (build only — install must be done on arm64 Debian)
 brew install dpkg
 ```
 
-**Edit → rebuild cycle:**
+### Using make (recommended)
 
 ```bash
-# 1. Edit scripts or docs as needed
-# 2. Sync docs into the package tree if you changed them
-mkdir -p debian/usr/share/doc/baize-kube/
+# Lint and test before building
+make lint
+make test
+
+# Build the package
+make build
+# Output: baize-kube_<version>_arm64.deb
+
+# Install on the target Pi
+make install
+# Or manually:
+# sudo dpkg -i baize-kube_*.deb
+```
+
+The `make build` target automatically:
+- Copies documentation into the package tree
+- Derives the version from git tags (falls back to `1.0.0`)
+- Injects the version into `debian/DEBIAN/control`
+- Builds with `--root-owner-group` for correct file ownership
+
+Other useful targets:
+
+| Target | Description |
+|--------|-------------|
+| `make lint` | Run shellcheck on all scripts and lintian on the package |
+| `make test` | Run the bats test suite (unit + integration) |
+| `make clean` | Remove the built .deb and generated doc directory |
+
+### Manual build
+
+If you prefer to build without make:
+
+```bash
+# 1. Copy documentation into the package tree
+mkdir -p debian/usr/share/doc/baize-kube
 cp doc/*.md debian/usr/share/doc/baize-kube/
 
-# 3. Rebuild
-dpkg-deb --build debian baize-kube_1.0_arm64.deb
+# 2. Build (version must match debian/DEBIAN/control)
+dpkg-deb --build --root-owner-group debian baize-kube_1.0_arm64.deb
 
-# 4. Transfer to the Pi and install
-scp baize-kube_1.0_arm64.deb <user>@<host>:~
-ssh <user>@<host> "sudo dpkg -i baize-kube_1.0_arm64.deb"
+# 3. Install on the target Pi
+sudo dpkg -i baize-kube_1.0_arm64.deb
 ```
 
 **To bump the version**, edit `debian/DEBIAN/control` first:
@@ -130,7 +161,14 @@ Version: 1.1
 Then rebuild, optionally renaming the output to match:
 
 ```bash
-dpkg-deb --build debian baize-kube_1.1_arm64.deb
+dpkg-deb --build --root-owner-group debian baize-kube_1.1_arm64.deb
+```
+
+### Transferring to a Pi
+
+```bash
+scp baize-kube_*.deb <user>@<host>:~
+ssh <user>@<host> "sudo dpkg -i baize-kube_*.deb"
 ```
 
 ---

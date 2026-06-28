@@ -51,8 +51,6 @@ require_root() {
 
 check_network() {
     info "Checking network connectivity..."
-    curl -fsSL --max-time 10 -o /dev/null https://storage.googleapis.com/ \
-        || fail "Cannot reach storage.googleapis.com. Ensure internet access before installing."
     curl -fsSL --max-time 10 -o /dev/null https://dl.k8s.io/ \
         || fail "Cannot reach dl.k8s.io. Ensure internet access before installing."
     if ! curl -fsSL --max-time 5 -o /dev/null https://github.com > /dev/null 2>&1; then
