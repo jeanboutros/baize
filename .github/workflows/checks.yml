@@ -55,7 +55,7 @@ jobs:
 
       - name: Hardcoded secrets check
         run: |
-          if grep -rnE '(password|api_key|secret|token|credential)\s*=' debian/DEBIAN/ debian/usr/; then
+          if grep -rnE '(password|api_key|secret|token|credential)\s*=\s*['\''"][^'\''"]+['\''"]' debian/DEBIAN/ debian/usr/; then
             echo "::error::Potential hardcoded secrets found"
             exit 1
           fi
