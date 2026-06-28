@@ -6,34 +6,25 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  lint:
-    name: Lint (shellcheck + lintian)
+  checks:
+    name: Script quality checks
+    uses: ./.github/workflows/checks.yml
+
+  lintian:
+    name: Lintian + Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Run shellcheck
-        run: |
-          shellcheck debian/DEBIAN/postinst
-          shellcheck debian/DEBIAN/postrm
-          shellcheck debian/DEBIAN/prerm
-          shellcheck debian/DEBIAN/config
-          shellcheck debian/usr/lib/baize-kube/complete-install
-          shellcheck debian/usr/local/bin/baize-kube-add-consumer
-          shellcheck debian/usr/local/bin/baize-kube-remove-consumer
-          shellcheck debian/usr/local/bin/baize-kube-list-consumers
-          shellcheck debian/usr/local/bin/baize-kube-update-kubeconfig
-
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Install lintian
         run: sudo apt-get install -y lintian
-
       - name: Build package
         run: make build
-
       - name: Run lintian
         run: lintian baize-kube_*.deb || true
 
@@ -41,76 +32,30 @@ jobs:
     name: Test (bats)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Install bats
         run: sudo apt-get update && sudo apt-get install -y bats
-
       - name: Run tests
         run: bats test/
-
-  syntax:
-    name: Syntax check (bash -n)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check all shell scripts parse
-        run: |
-          for f in \
-            debian/DEBIAN/postinst \
-            debian/DEBIAN/postrm \
-            debian/DEBIAN/prerm \
-            debian/DEBIAN/config \
-            debian/usr/lib/baize-kube/complete-install \
-            debian/usr/local/bin/baize-kube-add-consumer \
-            debian/usr/local/bin/baize-kube-remove-consumer \
-            debian/usr/local/bin/baize-kube-list-consumers \
-            debian/usr/local/bin/baize-kube-update-kubeconfig; do
-            echo "Checking $f..."
-            bash -n "$f" || exit 1
-          done
-          echo "All scripts pass syntax check."
-
-  security:
-    name: Security scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check for hardcoded secrets
-        run: |
-          ! grep -rnE '(password|api_key|secret|token|credential)\s*=' debian/DEBIAN/ debian/usr/ || \
-            { echo "WARNING: potential hardcoded secrets found (review manually)"; }
-
-      - name: Check for eval injection patterns
-        run: |
-          ! grep -rn 'eval echo' debian/ || \
-            { echo "FAIL: eval echo command injection vector found"; exit 1; }
-
-      - name: Check for huyang leakage
-        run: |
-          ! grep -rn 'huyang' debian/ doc/ README.md || \
-            { echo "FAIL: huyang username leakage found"; exit 1; }
 
   docs:
     name: Documentation checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v7
       - name: Check all doc links are valid files
         run: |
           errors=0
           for f in doc/*.md; do
-            # Extract markdown links to local files
-            grep -oP '\[.*?\]\(\.\.?/[^)]+\)' "$f" | sed 's/.*(\(.*\))/\1/' | while read -r link; do
+            while read -r link; do
               target="doc/$(basename "$link")"
               if [ ! -f "$target" ]; then
                 echo "Broken link in $f: $link -> $target (not found)"
                 errors=1
               fi
-            done
+            done < <(grep -oP '\[.*?\]\(\.\.?/[^)]+\)' "$f" | sed 's/.*(\(.*\))/\1/')
           done
           exit $errors
 

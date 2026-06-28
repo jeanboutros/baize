@@ -25,8 +25,12 @@ REBOOT_FLAG="/var/lib/baize-kube/needs-reboot"
 REBOOT_FLAG_DIR="/var/lib/baize-kube"
 
 ARCH="arm64"
-MINIKUBE_VERSION="v1.34.0"
+MINIKUBE_VERSION="v1.38.1"
 KUBECTL_VERSION="v1.31.0"  # Pinned for reproducibility; update with minikube version
+
+# Expected SHA256 checksum for minikube binary (defense-in-depth per OWASP A08)
+# Verify against https://github.com/kubernetes/minikube/releases/tag/${MINIKUBE_VERSION}
+MINIKUBE_SHA256="a0b8a1ebfc8c07a247271d8df98ac0ddd7c8c855b601d402463e2e50c08c6bab"
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -51,6 +55,9 @@ check_network() {
         || fail "Cannot reach storage.googleapis.com. Ensure internet access before installing."
     curl -fsSL --max-time 10 -o /dev/null https://dl.k8s.io/ \
         || fail "Cannot reach dl.k8s.io. Ensure internet access before installing."
+    if ! curl -fsSL --max-time 5 -o /dev/null https://github.com > /dev/null 2>&1; then
+        fail "Cannot reach github.com. Check network connectivity."
+    fi
     success "Network connectivity confirmed."
 }
 
@@ -299,7 +306,7 @@ download_with_retry() {
 download_binaries() {
     info "Downloading minikube ${MINIKUBE_VERSION} (${ARCH})..."
 
-    MINIKUBE_URL="https://storage.googleapis.com/minikube/releases/${MINIKUBE_VERSION}/minikube-linux-${ARCH}"
+    MINIKUBE_URL="https://github.com/kubernetes/minikube/releases/download/${MINIKUBE_VERSION}/minikube-linux-${ARCH}"
     MINIKUBE_SHA_URL="${MINIKUBE_URL}.sha256"
 
     # Download binary
@@ -311,18 +318,46 @@ download_binaries() {
     curl -fsSL --max-time 10 -o "${MINIKUBE_BIN}.sha256" "$MINIKUBE_SHA_URL" \
         || fail "Failed to download minikube checksum."
 
-    # The .sha256 file contains "<hash>  minikube-linux-arm64" — we need to check against our tmp file
+    # Validate checksum file content
+    if [ ! -s "${MINIKUBE_BIN}.sha256" ]; then
+        rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
+        fail "minikube checksum file is empty or missing."
+    fi
+    if ! grep -qE '^[a-f0-9]{64}$' "${MINIKUBE_BIN}.sha256"; then
+        rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
+        fail "minikube checksum file does not contain a valid SHA256 digest."
+    fi
+
+    # Verify binary is reasonably sized (minikube is ~123 MB for arm64)
+    MINIKUBE_SIZE=$(stat -c%s "${MINIKUBE_BIN}.tmp" 2>/dev/null || stat -f%z "${MINIKUBE_BIN}.tmp" 2>/dev/null || echo "0")
+    if [ "$MINIKUBE_SIZE" -lt 104857600 ]; then  # 100 MB minimum
+        rm -f "${MINIKUBE_BIN}.tmp"
+        fail "minikube binary is too small (${MINIKUBE_SIZE} bytes). Download may be incomplete."
+    fi
+
+    # The .sha256 file from GitHub releases contains just the hex digest (e.g., "a0b8a1eb...")
+    # awk '{print $1}' extracts it regardless of whether there's a trailing filename
     EXPECTED=$(awk '{print $1}' "${MINIKUBE_BIN}.sha256")
     ACTUAL=$(sha256sum "${MINIKUBE_BIN}.tmp" | awk '{print $1}')
 
+    # SHA256 digests are lowercase by convention; comparison is case-sensitive
     if [ "$EXPECTED" != "$ACTUAL" ]; then
         rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
         fail "minikube checksum verification FAILED. Expected: ${EXPECTED}, Got: ${ACTUAL}"
     fi
 
+    # Defense-in-depth: also verify against hardcoded expected hash
+    if [ "$EXPECTED" != "$MINIKUBE_SHA256" ]; then
+        warn "minikube checksum does not match hardcoded expected hash (version may have changed)."
+        warn "Expected: ${MINIKUBE_SHA256}"
+        warn "Got:      ${EXPECTED}"
+        # Non-fatal: the downloaded checksum already matched the binary
+    fi
+
     mv "${MINIKUBE_BIN}.tmp" "$MINIKUBE_BIN"
     chmod +x "$MINIKUBE_BIN"
     rm -f "${MINIKUBE_BIN}.sha256"
+
     success "minikube ${MINIKUBE_VERSION} installed and verified at ${MINIKUBE_BIN}."
 
     # kubectl — same pattern, using pinned version
@@ -349,6 +384,11 @@ download_binaries() {
     mv "${KUBECTL_BIN}.tmp" "$KUBECTL_BIN"
     chmod +x "$KUBECTL_BIN"
     rm -f "${KUBECTL_BIN}.sha256"
+
+    # Note: Kubernetes does not publish GPG signatures for kubectl binaries.
+    # SHA256 checksum verification (above) is the primary integrity check.
+    # For defense-in-depth, the checksum file itself is served over HTTPS from dl.k8s.io.
+
     success "kubectl ${KUBECTL_VERSION} installed and verified at ${KUBECTL_BIN}."
 }
 

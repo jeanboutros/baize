@@ -178,3 +178,13 @@ The Raspberry Pi 5 is an arm64 (AArch64) platform. It does not have KVM or any h
 The flag is a **no-op on arm64** — it simply skips a check that is irrelevant to the platform. It does not disable any actual virtualisation feature, because none exists to disable. The cluster runs correctly with software emulation, and the flag is safe to use permanently on this hardware.
 
 This is documented here so that future maintainers do not remove the flag thinking it is unnecessary or a workaround for a transient issue. It is a permanent, platform-appropriate configuration.
+
+---
+
+## Why the name Bai Ze?
+
+**Decision:** The project is named after Bai Ze (白泽; pinyin: Báizé), a creature from Chinese mythology.
+
+**Reasoning:** The Bai Ze myth originates from the **Bai Ze Tu** (白泽图, "Diagrams of Bai Ze"), a text from the era of the Yellow Emperor (circa 2698–2598 BCE). According to the legend, Bai Ze appeared before the Yellow Emperor and described 11,520 types of supernatural creatures. The Emperor had these descriptions recorded and illustrated, creating a bestiary that served as a guide to the spirit world.
+
+The project's role — cataloguing and managing containerised workloads on a Raspberry Pi cluster — mirrors Bai Ze's mythological function: bringing order and understanding to a complex, invisible world. Just as the Bai Ze Tu served as a guide to the spirit world, this package serves as a guide to running a rootless Kubernetes cluster on arm64 hardware.

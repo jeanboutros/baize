@@ -5,21 +5,48 @@ on:
     tags: ['v*']
 
 jobs:
+  checks:
+    name: Script quality checks
+    uses: ./.github/workflows/checks.yml
+
   release:
     name: Build and publish release
+    needs: checks
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set version from tag
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
 
+      - name: Validate VERSION format
+        run: |
+          if ! echo "${{ env.VERSION }}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::VERSION '${{ env.VERSION }}' is not a valid semver string"
+            exit 1
+          fi
+
       - name: Build package
         run: make build VERSION=${{ env.VERSION }}
+
+      - name: Install lintian
+        run: sudo apt-get install -y lintian
+
+      - name: Run lintian
+        run: lintian baize-kube_${{ env.VERSION }}_arm64.deb || true
+
+      - name: Verify .deb exists
+        run: |
+          DEB_FILE="baize-kube_${{ env.VERSION }}_arm64.deb"
+          if [ ! -f "$DEB_FILE" ]; then
+            echo "::error::$DEB_FILE not found — build may have failed"
+            exit 1
+          fi
+          echo "Release artifact: $DEB_FILE ($(du -h "$DEB_FILE" | cut -f1))"
 
       - name: Generate changelog
         run: |
@@ -31,9 +58,12 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: "baize-kube v${{ env.VERSION }}"
           body_path: CHANGELOG.txt
           files: baize-kube_${{ env.VERSION }}_arm64.deb
-          generate_release_notes: true
+
+      - name: Cleanup
+        if: always()
+        run: rm -f CHANGELOG.txt

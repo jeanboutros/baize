@@ -1,8 +1,12 @@
 # Bai Ze (白泽; pinyin: Báizé)
 
-Rootless minikube Kubernetes on Raspberry Pi 5, inspired by Bai Ze (白泽) the Chinese mythical creature symbolizing virtue and immense knowledge, and said to understand the languages of all living creatures and know the nature of all spirits.
+A Debian package that provisions rootless minikube Kubernetes on Raspberry Pi 5, inspired by Bai Ze (白泽; pinyin: Báizé) — the Chinese mythical creature who, entrusted by the Yellow Emperor, catalogued all the ghosts and spirits of the world.
 
 ---
+
+## About the Name
+
+Bai Ze (白泽) is a mythical creature from Chinese legend, first recorded in the *Bai Ze Tu* (白泽图, "Diagrams of Bai Ze"), a classical text said to have been compiled during the reign of the Yellow Emperor (c. 2697–2597 BCE). According to the tradition, Bai Ze appeared to the Yellow Emperor and catalogued 11,520 types of ghosts, spirits, and supernatural beings — along with methods to ward them off. The creature is thus associated with comprehensive knowledge, systematic cataloguing, and protection against chaos. This package, which systematically provisions and secures a Kubernetes cluster, is named in that spirit.
 
 ## Installation
 

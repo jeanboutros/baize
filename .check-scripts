@@ -1,0 +1,11 @@
+# Shell scripts checked by shellcheck, bash -n, and security scans
+# Used by: Makefile lint target, CI checks.yml reusable workflow
+debian/DEBIAN/postinst
+debian/DEBIAN/postrm
+debian/DEBIAN/prerm
+debian/DEBIAN/config
+debian/usr/lib/baize-kube/complete-install
+debian/usr/local/bin/baize-kube-add-consumer
+debian/usr/local/bin/baize-kube-remove-consumer
+debian/usr/local/bin/baize-kube-list-consumers
+debian/usr/local/bin/baize-kube-update-kubeconfig

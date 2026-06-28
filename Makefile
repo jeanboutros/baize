@@ -1,7 +1,7 @@
 .PHONY: all build clean lint test install
 
 PACKAGE := baize-kube
-VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.0.0")
+VERSION ?= $(shell TAG=$$(git describe --tags --abbrev=0 2>/dev/null); if [ -n "$$TAG" ]; then echo "$$TAG" | sed 's/^v//'; else echo "1.0.0"; fi)
 ARCH := arm64
 DEB := $(PACKAGE)_$(VERSION)_$(ARCH).deb
 
@@ -10,30 +10,37 @@ all: lint build
 build:
 	@mkdir -p debian/usr/share/doc/baize-kube
 	@cp doc/*.md debian/usr/share/doc/baize-kube/
-	@sed -i.bak "s/^Version:.*/Version: $(VERSION)/" debian/DEBIAN/control
+	@# Validate VERSION format (Debian Policy: must start with digit, only [A-Za-z0-9.+~:-])
+	@if ! echo "$(VERSION)" | grep -qE '^[0-9][A-Za-z0-9.+~:-]*$$'; then \
+		echo "ERROR: VERSION '$(VERSION)' is not a valid Debian version string"; \
+		exit 1; \
+	fi
+	@# Inject version into control file (preserve original)
+	@cp debian/DEBIAN/control debian/DEBIAN/control.orig
+	@sed "s/^Version:.*/Version: $(VERSION)/" debian/DEBIAN/control.orig > debian/DEBIAN/control
 	dpkg-deb --build debian $(DEB)
+	@# Restore original control file
+	@mv debian/DEBIAN/control.orig debian/DEBIAN/control
 	@echo "Built: $(DEB)"
 
 lint:
 	@echo "Running shellcheck..."
-	shellcheck debian/DEBIAN/postinst
-	shellcheck debian/DEBIAN/postrm
-	shellcheck debian/DEBIAN/prerm 2>/dev/null || true
-	shellcheck debian/DEBIAN/config 2>/dev/null || true
-	shellcheck debian/usr/local/bin/baize-kube-add-consumer
-	shellcheck debian/usr/local/bin/baize-kube-remove-consumer
-	shellcheck debian/usr/local/bin/baize-kube-list-consumers
-	shellcheck debian/usr/local/bin/baize-kube-update-kubeconfig
+	@grep -v '^#' .check-scripts | grep -v '^$$' | while read -r f; do \
+		shellcheck "$$f"; \
+	done
 	@echo "Running lintian..."
 	lintian $(DEB) 2>/dev/null || echo "lintian not installed (install: sudo apt install lintian)"
 
 test:
+	@if ! command -v bats > /dev/null 2>&1; then \
+		echo "bats not installed (install: sudo apt install bats)"; \
+		exit 1; \
+	fi
 	bats test/
 
 clean:
 	rm -f $(DEB)
 	rm -rf debian/usr/share/doc/baize-kube/
-	@if [ -f debian/DEBIAN/control.bak ]; then mv debian/DEBIAN/control.bak debian/DEBIAN/control; fi
 
 install:
 	sudo dpkg -i $(DEB)

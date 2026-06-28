@@ -1,0 +1,61 @@
+name: Script Quality Checks
+
+# Reusable workflow: called by ci.yml and release.yml via `uses:`.
+#
+# Limitations of `workflow_call`:
+#   - Cannot access the caller's `env` context. All data must be passed via
+#     `inputs` or read from files in the repository (e.g., .check-scripts).
+#   - This workflow does not use `inputs`; it reads the script list from
+#     .check-scripts, which is the single source of truth shared with the
+#     Makefile's `lint` target.
+#
+# Branch protection:
+#   - This workflow runs as a single `checks` job. Branch protection rules
+#     must require the `checks` job (not individual steps) to pass before
+#     merging. If the job structure changes (e.g., split into multiple jobs),
+#     branch protection rules must be updated to require all inner jobs.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Script quality checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run shellcheck
+        uses: ludeeus/action-shellcheck@v2
+        with:
+          scandir: './debian'
+          format: tty
+
+      - name: Syntax check (bash -n)
+        run: |
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [[ "$f" =~ ^# ]] && continue
+            echo "Checking $f..."
+            bash -n "$f" || exit 1
+          done < .check-scripts
+
+      - name: Eval injection check
+        run: |
+          ! grep -rn 'eval echo' debian/ || \
+            { echo "::error::eval echo command injection vector found"; exit 1; }
+
+      - name: Huyang leakage check
+        run: |
+          ! grep -rn 'huyang' debian/ doc/ README.md || \
+            { echo "::error::huyang username leakage found"; exit 1; }
+
+      - name: Hardcoded secrets check
+        run: |
+          if grep -rnE '(password|api_key|secret|token|credential)\s*=' debian/DEBIAN/ debian/usr/; then
+            echo "::error::Potential hardcoded secrets found"
+            exit 1
+          fi

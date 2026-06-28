@@ -151,7 +151,7 @@ sudo -u baize minikube stop
 
 # Re-download minikube
 sudo curl -fsSL -o /usr/local/bin/minikube \
-  https://storage.googleapis.com/minikube/releases/latest/minikube-linux-arm64
+  https://github.com/kubernetes/minikube/releases/download/latest/minikube-linux-arm64
 sudo chmod +x /usr/local/bin/minikube
 
 # Re-download kubectl
