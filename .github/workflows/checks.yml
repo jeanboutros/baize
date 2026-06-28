@@ -28,14 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
       - name: Run shellcheck
-        run: |
-          grep -v '^#' .check-scripts | grep -v '^$' | while read -r f; do
-            shellcheck "$f"
-          done
+        uses: ludeeus/action-shellcheck@v2.0.0
+        with:
+          scandir: './debian'
+          format: tty
 
       - name: Syntax check (bash -n)
         run: |
