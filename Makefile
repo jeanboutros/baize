@@ -1,4 +1,4 @@
-.PHONY: all build clean lint test install
+.PHONY: all build clean lint test install uninstall
 
 PACKAGE := baize-kube
 VERSION ?= $(shell TAG=$$(git describe --tags --abbrev=0 2>/dev/null); if [ -n "$$TAG" ]; then echo "$$TAG" | sed 's/^v//'; else echo "1.0.0"; fi)
@@ -43,4 +43,26 @@ clean:
 	rm -rf debian/usr/share/doc/baize-kube/
 
 install:
-	sudo dpkg -i $(DEB)
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "This target requires root privileges."; \
+		echo "Re-running with sudo..."; \
+		sudo make install; \
+	else \
+		dpkg -i $(DEB); \
+	fi
+
+uninstall:
+	@echo "Removing baize-kube..."
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "This target requires root privileges."; \
+		echo "Re-running with sudo..."; \
+		sudo make uninstall; \
+	else \
+		dpkg --purge baize-kube 2>/dev/null || echo "Package not installed."; \
+		rm -f /usr/local/bin/minikube /usr/local/bin/kubectl; \
+		rm -f /usr/local/bin/baize-kube-add-consumer; \
+		rm -f /usr/local/bin/baize-kube-remove-consumer; \
+		rm -f /usr/local/bin/baize-kube-list-consumers; \
+		rm -f /usr/local/bin/baize-kube-update-kubeconfig; \
+		echo "Uninstall complete."; \
+	fi

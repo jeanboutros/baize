@@ -173,6 +173,8 @@ export KUBECONFIG=/etc/baize-kube/admin-kubeconfig
 
 ## Adding consumers after installation
 
+> **Note:** All management scripts (`baize-kube-add-consumer`, `baize-kube-list-consumers`, `baize-kube-remove-consumer`, `baize-kube-update-kubeconfig`) require `sudo` because they access `/etc/baize-kube/admin-kubeconfig`, which is owned by `root:baize-admins` with mode 640. Only root (via sudo) can read this file.
+
 ### Group membership
 
 To give another user the right to be provisioned for cluster access:
@@ -218,7 +220,7 @@ sudo baize-kube-add-consumer dave --cluster-role my-custom-role
 ### Listing provisioned consumers
 
 ```bash
-baize-kube-list-consumers
+sudo baize-kube-list-consumers
 ```
 
 Output:

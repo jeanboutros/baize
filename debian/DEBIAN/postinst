@@ -308,92 +308,128 @@ download_with_retry() {
 }
 
 download_binaries() {
-    info "Downloading minikube ${MINIKUBE_VERSION} (${ARCH})..."
-
-    MINIKUBE_URL="https://github.com/kubernetes/minikube/releases/download/${MINIKUBE_VERSION}/minikube-linux-${ARCH}"
-    MINIKUBE_SHA_URL="${MINIKUBE_URL}.sha256"
-
-    # Download binary
-    download_with_retry "$MINIKUBE_URL" "${MINIKUBE_BIN}.tmp" "minikube" \
-        || fail "Failed to download minikube from ${MINIKUBE_URL}."
-
-    # Download and verify checksum
-    info "Verifying minikube checksum..."
-    curl -fsSL --max-time 10 -o "${MINIKUBE_BIN}.sha256" "$MINIKUBE_SHA_URL" \
-        || fail "Failed to download minikube checksum."
-
-    # Validate checksum file content
-    if [ ! -s "${MINIKUBE_BIN}.sha256" ]; then
-        rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
-        fail "minikube checksum file is empty or missing."
-    fi
-    if ! grep -qE '^[a-f0-9]{64}$' "${MINIKUBE_BIN}.sha256"; then
-        rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
-        fail "minikube checksum file does not contain a valid SHA256 digest."
+    # Check if minikube is already installed at the correct version
+    if [ -x "$MINIKUBE_BIN" ]; then
+        INSTALLED_VERSION=$("$MINIKUBE_BIN" version --short 2>/dev/null | head -1 | sed 's/^v//' || echo "")
+        if [ "$INSTALLED_VERSION" = "${MINIKUBE_VERSION#v}" ]; then
+            info "minikube ${MINIKUBE_VERSION} already installed — skipping download."
+            SKIP_MINIKUBE=1
+        else
+            if [ -n "$INSTALLED_VERSION" ]; then
+                info "minikube ${INSTALLED_VERSION} installed, upgrading to ${MINIKUBE_VERSION}..."
+            fi
+            SKIP_MINIKUBE=0
+        fi
+    else
+        SKIP_MINIKUBE=0
     fi
 
-    # Verify binary is reasonably sized (minikube is ~123 MB for arm64)
-    MINIKUBE_SIZE=$(stat -c%s "${MINIKUBE_BIN}.tmp" 2>/dev/null || stat -f%z "${MINIKUBE_BIN}.tmp" 2>/dev/null || echo "0")
-    if [ "$MINIKUBE_SIZE" -lt 104857600 ]; then  # 100 MB minimum
-        rm -f "${MINIKUBE_BIN}.tmp"
-        fail "minikube binary is too small (${MINIKUBE_SIZE} bytes). Download may be incomplete."
+    if [ "$SKIP_MINIKUBE" -eq 0 ]; then
+        info "Downloading minikube ${MINIKUBE_VERSION} (${ARCH})..."
+
+        MINIKUBE_URL="https://github.com/kubernetes/minikube/releases/download/${MINIKUBE_VERSION}/minikube-linux-${ARCH}"
+        MINIKUBE_SHA_URL="${MINIKUBE_URL}.sha256"
+
+        # Download binary
+        download_with_retry "$MINIKUBE_URL" "${MINIKUBE_BIN}.tmp" "minikube" \
+            || fail "Failed to download minikube from ${MINIKUBE_URL}."
+
+        # Download and verify checksum
+        info "Verifying minikube checksum..."
+        curl -fsSL --max-time 10 -o "${MINIKUBE_BIN}.sha256" "$MINIKUBE_SHA_URL" \
+            || fail "Failed to download minikube checksum."
+
+        # Validate checksum file content
+        if [ ! -s "${MINIKUBE_BIN}.sha256" ]; then
+            rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
+            fail "minikube checksum file is empty or missing."
+        fi
+        if ! grep -qE '^[a-f0-9]{64}$' "${MINIKUBE_BIN}.sha256"; then
+            rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
+            fail "minikube checksum file does not contain a valid SHA256 digest."
+        fi
+
+        # Verify binary is reasonably sized (minikube is ~123 MB for arm64)
+        MINIKUBE_SIZE=$(stat -c%s "${MINIKUBE_BIN}.tmp" 2>/dev/null || stat -f%z "${MINIKUBE_BIN}.tmp" 2>/dev/null || echo "0")
+        if [ "$MINIKUBE_SIZE" -lt 104857600 ]; then  # 100 MB minimum
+            rm -f "${MINIKUBE_BIN}.tmp"
+            fail "minikube binary is too small (${MINIKUBE_SIZE} bytes). Download may be incomplete."
+        fi
+
+        # The .sha256 file from GitHub releases contains just the hex digest (e.g., "a0b8a1eb...")
+        # awk '{print $1}' extracts it regardless of whether there's a trailing filename
+        EXPECTED=$(awk '{print $1}' "${MINIKUBE_BIN}.sha256")
+        ACTUAL=$(sha256sum "${MINIKUBE_BIN}.tmp" | awk '{print $1}')
+
+        # SHA256 digests are lowercase by convention; comparison is case-sensitive
+        if [ "$EXPECTED" != "$ACTUAL" ]; then
+            rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
+            fail "minikube checksum verification FAILED. Expected: ${EXPECTED}, Got: ${ACTUAL}"
+        fi
+
+        # Defense-in-depth: also verify against hardcoded expected hash
+        if [ "$EXPECTED" != "$MINIKUBE_SHA256" ]; then
+            warn "minikube checksum does not match hardcoded expected hash (version may have changed)."
+            warn "Expected: ${MINIKUBE_SHA256}"
+            warn "Got:      ${EXPECTED}"
+            # Non-fatal: the downloaded checksum already matched the binary
+        fi
+
+        mv "${MINIKUBE_BIN}.tmp" "$MINIKUBE_BIN"
+        chmod +x "$MINIKUBE_BIN"
+        rm -f "${MINIKUBE_BIN}.sha256"
+
+        success "minikube ${MINIKUBE_VERSION} installed and verified at ${MINIKUBE_BIN}."
     fi
 
-    # The .sha256 file from GitHub releases contains just the hex digest (e.g., "a0b8a1eb...")
-    # awk '{print $1}' extracts it regardless of whether there's a trailing filename
-    EXPECTED=$(awk '{print $1}' "${MINIKUBE_BIN}.sha256")
-    ACTUAL=$(sha256sum "${MINIKUBE_BIN}.tmp" | awk '{print $1}')
-
-    # SHA256 digests are lowercase by convention; comparison is case-sensitive
-    if [ "$EXPECTED" != "$ACTUAL" ]; then
-        rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
-        fail "minikube checksum verification FAILED. Expected: ${EXPECTED}, Got: ${ACTUAL}"
+    # Check if kubectl is already installed at the correct version
+    if [ -x "$KUBECTL_BIN" ]; then
+        INSTALLED_VERSION=$("$KUBECTL_BIN" version --client --short 2>/dev/null | awk '{print $3}' | sed 's/^v//' || echo "")
+        if [ "$INSTALLED_VERSION" = "${KUBECTL_VERSION#v}" ]; then
+            info "kubectl ${KUBECTL_VERSION} already installed — skipping download."
+            SKIP_KUBECTL=1
+        else
+            if [ -n "$INSTALLED_VERSION" ]; then
+                info "kubectl ${INSTALLED_VERSION} installed, upgrading to ${KUBECTL_VERSION}..."
+            fi
+            SKIP_KUBECTL=0
+        fi
+    else
+        SKIP_KUBECTL=0
     fi
 
-    # Defense-in-depth: also verify against hardcoded expected hash
-    if [ "$EXPECTED" != "$MINIKUBE_SHA256" ]; then
-        warn "minikube checksum does not match hardcoded expected hash (version may have changed)."
-        warn "Expected: ${MINIKUBE_SHA256}"
-        warn "Got:      ${EXPECTED}"
-        # Non-fatal: the downloaded checksum already matched the binary
+    if [ "$SKIP_KUBECTL" -eq 0 ]; then
+        # kubectl — same pattern, using pinned version
+        info "Downloading kubectl ${KUBECTL_VERSION} (${ARCH})..."
+
+        KUBECTL_URL="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
+        KUBECTL_SHA_URL="${KUBECTL_URL}.sha256"
+
+        download_with_retry "$KUBECTL_URL" "${KUBECTL_BIN}.tmp" "kubectl" \
+            || fail "Failed to download kubectl from ${KUBECTL_URL}."
+
+        info "Verifying kubectl checksum..."
+        curl -fsSL --max-time 10 -o "${KUBECTL_BIN}.sha256" "$KUBECTL_SHA_URL" \
+            || fail "Failed to download kubectl checksum."
+
+        EXPECTED=$(awk '{print $1}' "${KUBECTL_BIN}.sha256")
+        ACTUAL=$(sha256sum "${KUBECTL_BIN}.tmp" | awk '{print $1}')
+
+        if [ "$EXPECTED" != "$ACTUAL" ]; then
+            rm -f "${KUBECTL_BIN}.tmp" "${KUBECTL_BIN}.sha256"
+            fail "kubectl checksum verification FAILED. Expected: ${EXPECTED}, Got: ${ACTUAL}"
+        fi
+
+        mv "${KUBECTL_BIN}.tmp" "$KUBECTL_BIN"
+        chmod +x "$KUBECTL_BIN"
+        rm -f "${KUBECTL_BIN}.sha256"
+
+        # Note: Kubernetes does not publish GPG signatures for kubectl binaries.
+        # SHA256 checksum verification (above) is the primary integrity check.
+        # For defense-in-depth, the checksum file itself is served over HTTPS from dl.k8s.io.
+
+        success "kubectl ${KUBECTL_VERSION} installed and verified at ${KUBECTL_BIN}."
     fi
-
-    mv "${MINIKUBE_BIN}.tmp" "$MINIKUBE_BIN"
-    chmod +x "$MINIKUBE_BIN"
-    rm -f "${MINIKUBE_BIN}.sha256"
-
-    success "minikube ${MINIKUBE_VERSION} installed and verified at ${MINIKUBE_BIN}."
-
-    # kubectl — same pattern, using pinned version
-    info "Downloading kubectl ${KUBECTL_VERSION} (${ARCH})..."
-
-    KUBECTL_URL="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
-    KUBECTL_SHA_URL="${KUBECTL_URL}.sha256"
-
-    download_with_retry "$KUBECTL_URL" "${KUBECTL_BIN}.tmp" "kubectl" \
-        || fail "Failed to download kubectl from ${KUBECTL_URL}."
-
-    info "Verifying kubectl checksum..."
-    curl -fsSL --max-time 10 -o "${KUBECTL_BIN}.sha256" "$KUBECTL_SHA_URL" \
-        || fail "Failed to download kubectl checksum."
-
-    EXPECTED=$(awk '{print $1}' "${KUBECTL_BIN}.sha256")
-    ACTUAL=$(sha256sum "${KUBECTL_BIN}.tmp" | awk '{print $1}')
-
-    if [ "$EXPECTED" != "$ACTUAL" ]; then
-        rm -f "${KUBECTL_BIN}.tmp" "${KUBECTL_BIN}.sha256"
-        fail "kubectl checksum verification FAILED. Expected: ${EXPECTED}, Got: ${ACTUAL}"
-    fi
-
-    mv "${KUBECTL_BIN}.tmp" "$KUBECTL_BIN"
-    chmod +x "$KUBECTL_BIN"
-    rm -f "${KUBECTL_BIN}.sha256"
-
-    # Note: Kubernetes does not publish GPG signatures for kubectl binaries.
-    # SHA256 checksum verification (above) is the primary integrity check.
-    # For defense-in-depth, the checksum file itself is served over HTTPS from dl.k8s.io.
-
-    success "kubectl ${KUBECTL_VERSION} installed and verified at ${KUBECTL_BIN}."
 }
 
 # -----------------------------------------------------------------------------
@@ -614,7 +650,7 @@ echo "║  To provision a consumer:                                   ║"
 echo "║    sudo baize-kube-add-consumer <username>                  ║"
 echo "║                                                             ║"
 echo "║  To list provisioned consumers:                             ║"
-echo "║    baize-kube-list-consumers                                ║"
+echo "║    sudo baize-kube-list-consumers                           ║"
 echo "║                                                             ║"
 echo "║  To reconfigure minikube:                                   ║"
 echo "║    sudo -u baize minikube <command>                        ║"

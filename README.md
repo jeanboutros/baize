@@ -89,6 +89,24 @@ To reconfigure minikube:
 sudo -u baize minikube <command>
 ```
 
+### Management scripts
+
+Management scripts require `sudo` because they access `/etc/baize-kube/admin-kubeconfig` (owned by `root:baize-admins`, mode 640):
+
+```bash
+# Add a consumer user to the cluster
+sudo baize-kube-add-consumer <username>
+
+# List all provisioned consumers
+sudo baize-kube-list-consumers
+
+# Remove a consumer
+sudo baize-kube-remove-consumer <username>
+
+# Update a consumer's kubeconfig
+sudo baize-kube-update-kubeconfig <username>
+```
+
 ---
 
 ## Building and Installing
