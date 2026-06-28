@@ -224,16 +224,12 @@ consumer_selection() {
     fi
 
     # Priority 2: debconf (interactive only)
-    # Runs in a clean subshell because confmodule redirects stdout (fd1) to stderr
-    # and saves the original stdout as fd3. We must write to fd3 to capture output.
+    # Uses debconf-get (standalone binary) instead of sourcing confmodule.
+    # confmodule initializes a frontend which hangs in a subshell.
+    # debconf-get reads directly from the debconf database — no frontend needed.
     if [ -z "$consumers" ]; then
-        if [ -f /usr/share/debconf/confmodule ]; then
-            consumers=$(bash -c '
-                set -e
-                . /usr/share/debconf/confmodule
-                db_get baize-kube/consumers || true
-                echo "$RET" >&3
-            ')
+        if command -v debconf-get > /dev/null 2>&1; then
+            consumers=$(debconf-get baize-kube/consumers 2>/dev/null || echo "")
             consumers="$(echo "$consumers" | xargs)"
         fi
     fi
