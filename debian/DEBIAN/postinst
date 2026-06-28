@@ -32,6 +32,12 @@ KUBECTL_VERSION="v1.31.0"  # Pinned for reproducibility; update with minikube ve
 # Verify against https://github.com/kubernetes/minikube/releases/tag/${MINIKUBE_VERSION}
 MINIKUBE_SHA256="a0b8a1ebfc8c07a247271d8df98ac0ddd7c8c855b601d402463e2e50c08c6bab"
 
+# Source debconf library early — before any output — to set up the protocol
+# channel cleanly. confmodule redirects stdout to stderr (correct for postinst).
+if [ -f /usr/share/debconf/confmodule ]; then
+    . /usr/share/debconf/confmodule
+fi
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -224,13 +230,11 @@ consumer_selection() {
     fi
 
     # Priority 2: debconf (interactive only)
-    # Uses debconf-get (standalone binary) instead of sourcing confmodule.
-    # confmodule initializes a frontend which hangs in a subshell.
-    # debconf-get reads directly from the debconf database — no frontend needed.
+    # confmodule was sourced at the top of the script — db_get is available.
     if [ -z "$consumers" ]; then
-        if command -v debconf-get > /dev/null 2>&1; then
-            consumers=$(debconf-get baize-kube/consumers 2>/dev/null || echo "")
-            consumers="$(echo "$consumers" | xargs)"
+        if command -v db_get > /dev/null 2>&1; then
+            db_get baize-kube/consumers || true
+            consumers="$(echo "$RET" | xargs)"
         fi
     fi
 
