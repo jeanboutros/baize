@@ -26,7 +26,7 @@ REBOOT_FLAG_DIR="/var/lib/baize-kube"
 
 ARCH="arm64"
 MINIKUBE_VERSION="v1.38.1"
-KUBECTL_VERSION="v1.31.0"  # Pinned for reproducibility; update with minikube version
+KUBECTL_VERSION="v1.35.1"  # Pinned to match Kubernetes version deployed by minikube v1.38.1
 
 # Expected SHA256 checksum for minikube binary (defense-in-depth per OWASP A08)
 # Verify against https://github.com/kubernetes/minikube/releases/tag/${MINIKUBE_VERSION}
@@ -531,12 +531,16 @@ provision_kubeconfig() {
     chown "root:${ADMINS_GROUP}" /etc/baize-kube
     chmod 750 /etc/baize-kube
 
+    # Write kubeconfig to a temp location the baize user can access,
+    # then move it to the admin directory as root.
+    local tmp_kubeconfig="/tmp/baize-kube-admin-kubeconfig.$$"
     runuser -l "$BAIZE_USER" -s /bin/bash -c "
         export HOME=${BAIZE_HOME}
         export XDG_RUNTIME_DIR=/run/user/\$(id -u)
         export MINIKUBE_ROOTLESS=true
-        ${MINIKUBE_BIN} kubectl -- config view --flatten > ${ADMIN_KUBECONFIG}
+        ${MINIKUBE_BIN} kubectl -- config view --flatten > ${tmp_kubeconfig}
     " || fail "Failed to export admin kubeconfig."
+    mv "$tmp_kubeconfig" "$ADMIN_KUBECONFIG"
 
     chown "root:${ADMINS_GROUP}" "$ADMIN_KUBECONFIG"
     chmod 640 "$ADMIN_KUBECONFIG"
