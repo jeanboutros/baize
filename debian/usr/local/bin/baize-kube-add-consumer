@@ -323,7 +323,7 @@ build_kubeconfig() {
     local secret_name="consumer-${USERNAME}-token"
     local token
     token=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get secret "$secret_name" -n default \
-        -o jsonpath='{.data.token}')
+        -o jsonpath='{.data.token}' | base64 -d)
 
     # Create .kube directory
     mkdir -p "$kube_dir"
