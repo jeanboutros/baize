@@ -73,6 +73,27 @@ sed -i "/^${BAIZE_USER}:/d" /etc/subgid 2>/dev/null || true
 success "subuid/subgid entries removed."
 
 # -----------------------------------------------------------------------------
+# 3b. Clean consumer kubeconfigs (before removing consumers.conf and group)
+# -----------------------------------------------------------------------------
+
+CONSUMERS_CONF="${KUBECONFIG_DIR}/consumers.conf"
+info "Cleaning consumer kubeconfigs..."
+if [ -f "$CONSUMERS_CONF" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Strip inline comments and trim whitespace
+        line="${line%%#*}"
+        line="$(echo "$line" | xargs)"
+        [ -n "$line" ] || continue
+        consumer_kubeconfig="/home/${line}/.kube/config"
+        if [ -f "$consumer_kubeconfig" ]; then
+            rm -f "$consumer_kubeconfig"
+            info "Removed kubeconfig for consumer '${line}'."
+        fi
+    done < "$CONSUMERS_CONF"
+fi
+success "Consumer kubeconfigs cleaned."
+
+# -----------------------------------------------------------------------------
 # 4. Remove baize-consumers group
 # -----------------------------------------------------------------------------
 
@@ -169,8 +190,10 @@ echo "║  baize-kube removed                                         ║"
 echo "║                                                             ║"
 echo "║  NOTE: /boot/firmware/cmdline.txt was NOT modified.        ║"
 echo "║  The cgroup_memory=1 cgroup_enable=memory parameters       ║"
-echo "║  remain in place. To remove them manually:                  ║"
+echo "║  remain in place to avoid conflicts with other             ║"
+echo "║  applications that may also need these kernel parameters.  ║"
 echo "║                                                             ║"
+echo "║  To remove them (if no other apps need them):              ║"
 echo "║    sudo nano /boot/firmware/cmdline.txt                    ║"
 echo "║                                                             ║"
 echo "║  Remove the following from the line, then reboot:          ║"
