@@ -1,11 +1,30 @@
 #!/bin/bash
+# =============================================================================
+# baize-kube postinst — educational annotated installer
+#
+# This is a Debian maintainer script. dpkg runs it AFTER the package files
+# are unpacked, passing $1="configure". It provisions everything the
+# package needs at runtime: users, cgroups, binaries, a podman machine,
+# the minikube cluster, and kubeconfigs.
+#
+# SCRIPT SAFETY HEADER (required by project convention):
+#   set -e  — exit immediately if any command returns non-zero
+#   set -u  — treat references to UNSET variables as fatal errors
+#             (catches typos like $BAIZE_USR early, instead of silently
+#             expanding to an empty string)
+#   set -o pipefail — a pipeline's exit status is the FIRST failing
+#             command's status, not just the last one (without this,
+#             `false | true` would wrongly report success)
+#   To learn more, look up "set builtin" and "pipefail" in `man bash`
+#   or: https://www.gnu.org/software/bash/manual/bash.html#The-Set-Builtin
+# =============================================================================
 set -euo pipefail
 
-# =============================================================================
-# baize-kube postinst
-# Provisions the baize user, cgroup delegation, minikube, and systemd service.
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Configuration constants
+# -----------------------------------------------------------------------------
+# These are ordinary shell variable assignments (no spaces around '=').
+# By convention they are UPPERCASE to signal "treat me as a constant".
 BAIZE_USER="baize"
 BAIZE_GROUP="baize"
 ADMINS_GROUP="baize-admins"
@@ -25,29 +44,80 @@ REBOOT_FLAG="/var/lib/baize-kube/needs-reboot"
 REBOOT_FLAG_DIR="/var/lib/baize-kube"
 
 ARCH="arm64"
-MINIKUBE_VERSION="v1.38.1"
-KUBECTL_VERSION="v1.35.1"  # Pinned to match Kubernetes version deployed by minikube v1.38.1
+# Pinned versions. minikube v1.39.0 defaults to Kubernetes v1.37.0, so kubectl
+# is pinned to v1.37.0 to match — kubectl should be the same minor version as
+# the API server it talks to (version-skew policy, kubernetes.io docs).
+MINIKUBE_VERSION="v1.39.0"
+KUBECTL_VERSION="v1.37.0"  # Pinned to match Kubernetes version deployed by minikube v1.39.0
 
 # Expected SHA256 checksum for minikube binary (defense-in-depth per OWASP A08)
 # Verify against https://github.com/kubernetes/minikube/releases/tag/${MINIKUBE_VERSION}
-MINIKUBE_SHA256="a0b8a1ebfc8c07a247271d8df98ac0ddd7c8c855b601d402463e2e50c08c6bab"
+MINIKUBE_SHA256="202f331cb677761c5aec81c58472d16d65707358b9f66226210be3fe3275b1c3"
+# Pinned SHA256 for kubectl (authoritative: dl.k8s.io .../kubectl.sha256).
+# Verified 2026-09-06 against https://dl.k8s.io/release/v1.37.0/bin/linux/arm64/kubectl.sha256
+KUBECTL_SHA256="922df28df248cc00a9e025f947704f1d1482de64ece54cfe57e61f19eaf1eef3"
+
+# Podman machine settings — dedicated QEMU VM owned by the baize user.
+# minikube's podman driver talks to the machine's API socket via CONTAINER_HOST.
+PODMAN_BIN="/usr/bin/podman"
+PODMAN_LIBEXECDIR="/usr/libexec/podman"
+PODMAN_MACHINE_NAME="minikube"
+
+# Machine sizing can be overridden BEFORE installation via environment
+# variables (useful on memory-constrained hosts or in CI):
+#   sudo env BAIZE_KUBE_MACHINE_CPUS=2 \
+#            BAIZE_KUBE_MACHINE_MEMORY=4096 \
+#            dpkg -i baize-kube_*.deb
+# ${VAR:-default} is parameter expansion: use $VAR if it is set and
+# non-empty, otherwise fall back to the default.
+#
+# SIZING NOTES (verified against minikube v1.39.0 source, start.go):
+#   - minikube's hard minimum is 1800 MiB, but its SUGGESTED node
+#     allocation for this topology is 3072 MiB (fallback constant in
+#     suggestMemoryAllocation). The node container gets --memory=3072
+#     even in a small machine, so the machine floor must be
+#     3072 (node) + ~1 GiB (Fedora CoreOS guest) = 4096 MiB.
+#   - The 6144 MiB default leaves headroom on an 8 GiB Pi: a full
+#     8 GiB machine would overcommit the host.
+PODMAN_MACHINE_CPUS="${BAIZE_KUBE_MACHINE_CPUS:-4}"
+PODMAN_MACHINE_MEMORY="${BAIZE_KUBE_MACHINE_MEMORY:-6144}"   # MiB
+PODMAN_MACHINE_DISK=30       # GiB
+BASH_COMPLETION_DIR="/etc/bash_completion.d"
 
 # Source debconf library early — before any output — to set up the protocol
-# channel cleanly. confmodule redirects stdout to stderr (correct for postinst).
-if [ -f /usr/share/debconf/confmodule ]; then
+# channel cleanly. confmodule redirects stdout to stderr (correct for postinst,
+# because dpkg reads postinst's stdout for debconf protocol messages).
+# To learn more, look up "debconf" in `man 7 debconf` / Debian Policy 3.9.6.
+#
+# The `command -v db_get` guard means: only source confmodule when the debconf
+# helper functions are NOT already defined. dpkg never predefines them, so in
+# real installs this always sources. The unit tests, however, predefine db_get
+# etc. — skipping the source keeps the test shell's stdout intact (confmodule
+# redirects fd 1 for its protocol, which would break the test harness).
+if ! command -v db_get > /dev/null 2>&1 && [ -f /usr/share/debconf/confmodule ]; then
     . /usr/share/debconf/confmodule
+    # NOTE: the single dot '.' is POSIX "source" — it reads and executes the
+    # file in the CURRENT shell (so its functions/variables persist here).
 fi
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Logging helpers
 # -----------------------------------------------------------------------------
+# Each is a small function that echoes a prefixed line. `$*` inside a function
+# expands to ALL arguments joined into one word string — to learn more, look
+# up "special parameters" in `man bash` ($* vs $@).
 
 info()    { echo "[baize-kube] INFO:  $*"; }
 success() { echo "[baize-kube] OK:    $*"; }
 warn()    { echo "[baize-kube] WARN:  $*"; }
+# The failure helper must write to stderr (>&2) so normal output (stdout)
+# stays clean for scripts, and must exit 1 so dpkg sees the failure.
 fail()    { echo "[baize-kube] ERROR: $*" >&2; exit 1; }
 
 require_root() {
+    # Test operator -eq: "is EQUAL TO" for integers (vs = for strings).
+    # $(id -u) runs id in a "command substitution" and inserts its stdout
+    # here. To learn more, look up "command substitution" in `man bash`.
     [ "$(id -u)" -eq 0 ] || fail "This script must be run as root."
 }
 
@@ -57,6 +127,10 @@ require_root() {
 
 check_network() {
     info "Checking network connectivity..."
+    # curl flags: -f (fail on HTTP errors instead of silently outputting the
+    #              error page), -s (silent, no progress bar), -S (show errors),
+    #              -L (follow redirects), --max-time (overall timeout).
+    # -o /dev/null discards the downloaded body — we only care whether it works.
     curl -fsSL --max-time 10 -o /dev/null https://dl.k8s.io/ \
         || fail "Cannot reach dl.k8s.io. Ensure internet access before installing."
     if ! curl -fsSL --max-time 5 -o /dev/null https://github.com > /dev/null 2>&1; then
@@ -72,26 +146,35 @@ check_network() {
 check_and_patch_cgroup() {
     info "Checking cgroup v2 memory controller..."
 
+    # $(cat file 2>/dev/null || echo "") — read a file, but if it does not
+    # exist (2>/dev/null hides the error) fall back to an empty string so the
+    # variable is never UNSET (set -u would otherwise abort the script).
     CONTROLLERS=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || echo "")
 
+    # grep -qw "memory" — -w matches whole WORDS only (avoids matching e.g.
+    # "memoryfoo"), and -q is "quiet" (exit status only, no output).
     if echo "$CONTROLLERS" | grep -qw "memory"; then
         info "cgroup memory controller already active — skipping cmdline.txt edit."
+        # return 0 = leave this function with success (0 is success in Unix).
         return 0
     fi
 
     warn "cgroup memory controller is NOT active."
     info "Checking ${CMDLINE_FILE}..."
 
+    # -f = "file exists" test operator. To learn more, look up "test" / "[" in `man bash`.
     [ -f "$CMDLINE_FILE" ] || fail "${CMDLINE_FILE} not found. Cannot enable memory cgroup."
 
     CMDLINE=$(cat "$CMDLINE_FILE")
 
+    # grep -q = quiet: only the exit code matters (0 = found, 1 = not found).
     if echo "$CMDLINE" | grep -q "cgroup_enable=memory"; then
         info "cgroup_enable=memory already present in ${CMDLINE_FILE} — skipping edit."
     else
         info "Patching ${CMDLINE_FILE} to enable memory cgroup..."
-        # Must remain a single line
-        # Only create backup if it doesn't already exist
+        # Must remain a single line (the bootloader reads exactly one line).
+        # Only create backup if it doesn't already exist — the -f test avoids
+        # overwriting our own backup on a re-run (idempotency).
         [ -f "${CMDLINE_FILE}.bak-baize-kube" ] || cp "$CMDLINE_FILE" "${CMDLINE_FILE}.bak-baize-kube"
         echo "${CMDLINE} cgroup_memory=1 cgroup_enable=memory" > "$CMDLINE_FILE"
         success "Patched ${CMDLINE_FILE}."
@@ -101,6 +184,7 @@ check_and_patch_cgroup() {
     info "Installing post-reboot trigger..."
 
     mkdir -p "$REBOOT_FLAG_DIR"
+    # touch creates an empty file (or updates its mtime if it exists)
     touch "$REBOOT_FLAG"
 
     cp "$REBOOT_SERVICE_SRC" "$REBOOT_SERVICE_DST"
@@ -124,7 +208,10 @@ check_and_patch_cgroup() {
     echo "║  No manual re-run of dpkg is required.                     ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo ""
-    exit 1  # Non-zero exit so dpkg leaves package Half-Configured
+    # Non-zero exit so dpkg marks the package Half-Configured; the reboot
+    # service re-runs `dpkg --configure baize-kube` (i.e. this script) after
+    # the reboot, and this time the memory controller test passes.
+    exit 1
 }
 
 # -----------------------------------------------------------------------------
@@ -133,13 +220,58 @@ check_and_patch_cgroup() {
 
 configure_cgroup_delegation() {
     info "Configuring systemd cgroup delegation..."
+    # dirname strips the last path component — here it makes sure the parent
+    # directory /etc/systemd/system/user@.service.d/ exists first.
     mkdir -p "$(dirname "$DELEGATE_CONF")"
+    # Here-doc (<<EOF ... EOF) feeds the text between the markers to cat's
+    # stdin. WITHOUT quotes around EOF, $variables expand (we don't need any
+    # here, but unquoted is the default); with <<'EOF' nothing would expand.
     cat > "$DELEGATE_CONF" <<EOF
 [Service]
 Delegate=cpu cpuset io memory pids
 EOF
+    # daemon-reload makes systemd re-read unit files from disk — required
+    # after creating/modifying any drop-in or unit, or the change is ignored
+    # until the next boot.
     systemctl daemon-reload
     success "cgroup delegation configured at ${DELEGATE_CONF}."
+}
+
+# -----------------------------------------------------------------------------
+# 3b. Link podman machine helper binaries (gvproxy, virtiofsd)
+# -----------------------------------------------------------------------------
+
+# Podman's machine stack (QEMU provider) looks for helper binaries in
+# /usr/libexec/podman (and a few sibling dirs) — see containers/common
+# FindHelperBinary(). Debian ships them elsewhere:
+#   gvproxy   -> /usr/bin/gvproxy                (package: gvproxy)
+#   virtiofsd -> /usr/libexec/virtiofsd          (package: virtiofsd)
+# /usr/libexec is not in $PATH and is not a podman helper dir, so without
+# these symlinks `podman machine start` fails (missing virtiofsd is fatal;
+# gvproxy is found via $PATH on Debian thanks to Debian's podman patch,
+# the symlink is belt-and-braces).
+link_podman_helpers() {
+    info "Linking podman machine helper binaries..."
+
+    mkdir -p "$PODMAN_LIBEXECDIR"
+
+    # -x = "file exists AND is executable" test operator.
+    if [ -x /usr/bin/gvproxy ]; then
+        # ln -sfn: -s symbolic link, -f overwrite if it exists (so re-running
+        # the installer refreshes the link), -n treat an existing symlink to a
+        # DIRECTORY as a file rather than following it (safety).
+        ln -sfn /usr/bin/gvproxy "${PODMAN_LIBEXECDIR}/gvproxy"
+        success "Linked /usr/bin/gvproxy -> ${PODMAN_LIBEXECDIR}/gvproxy"
+    else
+        fail "gvproxy not found at /usr/bin/gvproxy — install the gvproxy package."
+    fi
+
+    if [ -x /usr/libexec/virtiofsd ]; then
+        ln -sfn /usr/libexec/virtiofsd "${PODMAN_LIBEXECDIR}/virtiofsd"
+        success "Linked /usr/libexec/virtiofsd -> ${PODMAN_LIBEXECDIR}/virtiofsd"
+    else
+        fail "virtiofsd not found at /usr/libexec/virtiofsd — install the virtiofsd package."
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -148,6 +280,12 @@ EOF
 
 provision_user() {
     info "Provisioning user and groups..."
+
+    # Idempotency pattern used throughout this script: check-then-act.
+    # getent queries the NSS databases (groups/users); exit status 2 = not
+    # found. Redirecting to /dev/null discards its output — we only need the
+    # exit code. `if !` inverts it: run the body only when NOT found.
+    # To learn more, look up "getent" in `man getent`.
 
     # baize-admins group for cluster administrators
     if ! getent group "$ADMINS_GROUP" > /dev/null 2>&1; then
@@ -175,18 +313,49 @@ provision_user() {
             --comment "baize minikube service account" \
             --groups "$CONSUMERS_GROUP" \
             "$BAIZE_USER"
-        # Lock the password — no interactive login
+        # Lock the password — no interactive login. A locked account can
+        # still run services (we never need its password; access is via
+        # `runuser`/`sudo` from root).
         passwd -l "$BAIZE_USER"
         success "User '${BAIZE_USER}' created and locked."
     else
         info "User '${BAIZE_USER}' already exists."
     fi
 
-    # Ensure subuid and subgid ranges exist for rootless Podman
+    # Ensure KVM access for QEMU hardware acceleration.
+    # The Raspberry Pi 5 exposes /dev/kvm; without kvm group membership
+    # QEMU falls back to software emulation (TCG) which is unusably slow.
+    # usermod -aG kvm baize: -a = APPEND to the user's existing supplementary
+    # group list (without -a, -G would REPLACE the whole list!), -G targets
+    # supplementary groups. This runs unconditionally, so a reinstall over a
+    # pre-existing user fixes a missing group too.
+    if getent group kvm > /dev/null 2>&1; then
+        usermod -aG kvm "$BAIZE_USER"
+        if [ ! -e /dev/kvm ]; then
+            # -e = "file exists" (any type: regular, device, symlink...).
+            warn "Group kvm exists but /dev/kvm is absent — QEMU will use slow software emulation."
+        fi
+    else
+        warn "Group kvm does not exist — QEMU will use slow software emulation (TCG)."
+    fi
+
+    # Ensure subuid and subgid ranges exist for rootless Podman.
+    # /etc/subuid format is "name:first-id-of-range:count" — rootless
+    # containers map their internal root to a slice of these IDs.
+    # grep -q = quiet (exit code only); "^${BAIZE_USER}:" anchors the match
+    # to a line that STARTS (^) with "baize:" so we don't match a comment
+    # or a substring of another username.
     if ! grep -q "^${BAIZE_USER}:" /etc/subuid 2>/dev/null; then
-        # Find a free range starting after any existing entries
+        # Find a free range starting after any existing entries.
+        # awk -F: '{print $2+$3}' — -F: splits each line on colons into
+        # fields $1,$2,$3; for each line print the sum of field 2 (start)
+        # and field 3 (count), i.e. the first FREE id after that range.
+        # Then sort -n (numeric) and tail -1 (last line) = the highest.
         LAST_SUBUID=$(awk -F: '{print $2+$3}' /etc/subuid 2>/dev/null | sort -n | tail -1)
+        # ${VAR:-default} = use $VAR if it is set and non-empty, else the
+        # default — here: empty file means "start at 100000".
         START=${LAST_SUBUID:-100000}
+        # >> APPENDS to the file (a single > would truncate it!)
         echo "${BAIZE_USER}:${START}:65536" >> /etc/subuid
         success "subuid range ${START}:65536 assigned to ${BAIZE_USER}."
     else
@@ -210,6 +379,9 @@ provision_user() {
 consumer_selection() {
     info "Selecting consumer users for '${CONSUMERS_GROUP}'..."
 
+    # `local` restricts a variable to this function's scope, so it cannot
+    # leak into (or collide with) the global scope. To learn more, look up
+    # "local" in `man bash`.
     local consumers=""
     local first_admin=""
     local username
@@ -217,22 +389,47 @@ consumer_selection() {
     local skipped=0
 
     # Priority 1: Config file
+    # -s = "file exists AND is NOT empty" test operator (a 0-byte conf file
+    # should be treated as missing, hence -s not -f).
     if [ -s "$CONSUMERS_CONF" ]; then
         info "Reading consumers from ${CONSUMERS_CONF}..."
-        # Read non-empty, non-comment lines
+        # Robust line-reading idiom: `while IFS= read -r line`.
+        #   IFS=      disables stripping of leading/trailing whitespace
+        #   -r        stops backslashes from being interpreted as escapes
+        #   || [ -n "$line" ] handles a missing final newline: read returns
+        #             non-zero at EOF, but $line may still hold the last
+        #             (unterminated) line — -n (non-empty string) lets us
+        #             process it anyway.
+        # To learn more, look up "read" in `man bash` and the Bash FAQ
+        # "read: why doesn't my loop terminate".
         while IFS= read -r line || [ -n "$line" ]; do
-            # Strip inline comments and trim whitespace
+            # ${line%%#*} is PARAMETER EXPANSION: %% removes the LONGEST
+            # suffix matching "#*" (i.e. everything from the first '#' on).
+            # Result: inline comments are stripped. To learn more, look up
+            # "parameter expansion" / "%% pattern" in `man bash`.
             line="${line%%#*}"
+            # Trim whitespace via xargs (a quick trick: xargs squeezes
+            # and trims whitespace of its input words).
             line="$(echo "$line" | xargs)"
+            # -n = "string is NOT empty" test operator. `continue` skips to
+            # the next loop iteration (blank lines land here).
             [ -n "$line" ] || continue
+            # ${consumers:+ } is parameter expansion: it expands to a single
+            # space ONLY if $consumers is non-empty — giving us "space-
+            # separated append" without a leading space on the first item.
             consumers="${consumers}${consumers:+ }${line}"
         done < "$CONSUMERS_CONF"
     fi
 
     # Priority 2: debconf (interactive only)
     # confmodule was sourced at the top of the script — db_get is available.
+    # -z is the mirror of -n: "string IS empty".
     if [ -z "$consumers" ]; then
+        # command -v prints a command's path if it exists — the portable
+        # replacement for the older `which`.
         if command -v db_get > /dev/null 2>&1; then
+            # `|| true` converts a possible non-zero db_get status into
+            # success so `set -e` does not abort (missing template is fine).
             db_get baize-kube/consumers || true
             consumers="$(echo "$RET" | xargs)"
         fi
@@ -240,17 +437,24 @@ consumer_selection() {
 
     # Priority 3: Fail — no fallback to "all users"
     if [ -z "$consumers" ]; then
+        # ${DEBIAN_FRONTEND:-} — use the variable if set, else empty string
+        # (needed under `set -u` to avoid an "unbound variable" error).
         if [ -n "${DEBIAN_FRONTEND:-}" ] && [ "$DEBIAN_FRONTEND" = "noninteractive" ]; then
             fail "No ${CONSUMERS_CONF} found and running non-interactively. Create ${CONSUMERS_CONF} with one username per line for unattended installs."
         fi
         fail "No consumers specified. Create ${CONSUMERS_CONF} or re-run interactively."
     fi
 
-    # Validate and add each consumer
+    # Validate and add each consumer.
+    # UNQUOTED $consumers is intentional: the shell performs WORD SPLITTING
+    # on it, turning "alice bob" into two separate loop values. (Normally a
+    # bug source, here it is exactly the list semantics we want.)
     for username in $consumers; do
         # Skip the baize user itself
         if [ "$username" = "$BAIZE_USER" ]; then
             info "Skipping '${BAIZE_USER}' (cluster owner, not a consumer)."
+            # $(( )) is ARITHMETIC EXPANSION — computes and substitutes the
+            # result. To learn more, look up "arithmetic expansion" in `man bash`.
             skipped=$((skipped + 1))
             continue
         fi
@@ -271,6 +475,7 @@ consumer_selection() {
         fi
     done
 
+    # -eq = numeric "is equal to"; -gt = "is greater than" (integer tests).
     if [ "$added" -eq 0 ] && [ "$skipped" -gt 0 ]; then
         fail "No valid consumer users were added. Check ${CONSUMERS_CONF} or re-run interactively."
     fi
@@ -290,33 +495,51 @@ consumer_selection() {
 
 # Helper for retryable downloads
 download_with_retry() {
+    # Positional parameters: $1 = first argument, etc. We copy them into named
+    # `local` variables for readability.
     local url="$1"
     local output="$2"
     local description="$3"
     local max_retries=3
     local attempt=1
 
+    # Classic counting loop. -le = numeric "less than or equal".
     while [ $attempt -le $max_retries ]; do
-        if curl -fsSL --max-time 120 -o "$output" "$url"; then
+        # 600 s budget: the minikube binary is ~130 MB — on a slow Pi
+        # uplink the previous 120 s cap needed >1 MB/s and failed all
+        # retries even on a working connection.
+        if curl -fsSL --max-time 600 -o "$output" "$url"; then
+            # 0 = success in Unix — return it immediately on first success.
             return 0
         fi
         warn "Download attempt ${attempt}/${max_retries} failed for ${description}. Retrying in 5s..."
         sleep 5
         attempt=$((attempt + 1))
     done
+    # All attempts exhausted — non-zero signals failure to the caller, which
+    # (under `set -e`) aborts the install with our fail() message.
     return 1
 }
 
 download_binaries() {
-    # Check if minikube is already installed at the correct version
+    # Check if minikube is already installed at the correct version.
+    # -x = "file exists and is executable" test operator.
     if [ -x "$MINIKUBE_BIN" ]; then
-        INSTALLED_VERSION=$("$MINIKUBE_BIN" version --short 2>/dev/null | head -1 | sed 's/^v//' || echo "")
-        if [ "$INSTALLED_VERSION" = "${MINIKUBE_VERSION#v}" ]; then
-            info "minikube ${MINIKUBE_VERSION} already installed — skipping download."
+        # SUPPLY-CHAIN: a binary's own "version" output is self-reported and
+        # cannot be trusted — a substituted binary could simply print the
+        # expected string. When a binary is present we therefore ALWAYS
+        # re-verify it against the PINNED hash (MINIKUBE_SHA256), and only
+        # skip the DOWNLOAD (not the verification) when it matches.
+        INSTALLED_SHA=$(sha256sum "$MINIKUBE_BIN" 2>/dev/null | awk '{print $1}')
+        if [ "$INSTALLED_SHA" = "$MINIKUBE_SHA256" ]; then
+            info "minikube ${MINIKUBE_VERSION} installed, pinned checksum verified — skipping download."
             SKIP_MINIKUBE=1
         else
+            INSTALLED_VERSION=$("$MINIKUBE_BIN" version --short 2>/dev/null | head -1 | sed 's/^v//' || echo "")
             if [ -n "$INSTALLED_VERSION" ]; then
-                info "minikube ${INSTALLED_VERSION} installed, upgrading to ${MINIKUBE_VERSION}..."
+                info "minikube ${INSTALLED_VERSION} present but checksum mismatch — re-downloading pinned ${MINIKUBE_VERSION}."
+            else
+                info "Existing minikube binary failed checksum — re-downloading ${MINIKUBE_VERSION}."
             fi
             SKIP_MINIKUBE=0
         fi
@@ -341,38 +564,52 @@ download_binaries() {
 
         # Validate checksum file content
         if [ ! -s "${MINIKUBE_BIN}.sha256" ]; then
+            # -s = "file exists and is NON-EMPTY" — a truncated download that
+            # left a 0-byte file must be treated as missing.
             rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
             fail "minikube checksum file is empty or missing."
         fi
+        # grep -E uses EXTENDED regular expressions. ^[a-f0-9]{64}$ anchors
+        # the pattern: exactly 64 lowercase hex chars and nothing else — a
+        # valid SHA256 digest line. To learn more, look up "grep -E" / ERE.
         if ! grep -qE '^[a-f0-9]{64}$' "${MINIKUBE_BIN}.sha256"; then
             rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
             fail "minikube checksum file does not contain a valid SHA256 digest."
         fi
 
-        # Verify binary is reasonably sized (minikube is ~123 MB for arm64)
+        # Verify binary is reasonably sized (minikube v1.39.0 arm64 is ~130 MB).
+        # stat -c%s prints the size in bytes on Linux (-f%z is the macOS/BSD
+        # equivalent — the fallback makes the line portable). `|| echo "0"`
+        # guarantees a number even if both stat calls fail.
         MINIKUBE_SIZE=$(stat -c%s "${MINIKUBE_BIN}.tmp" 2>/dev/null || stat -f%z "${MINIKUBE_BIN}.tmp" 2>/dev/null || echo "0")
-        if [ "$MINIKUBE_SIZE" -lt 104857600 ]; then  # 100 MB minimum
-            rm -f "${MINIKUBE_BIN}.tmp"
+        # -lt = numeric "less than". 104857600 = 100 MiB (1024*1024*100).
+        if [ "$MINIKUBE_SIZE" -lt 104857600 ]; then
+            rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
             fail "minikube binary is too small (${MINIKUBE_SIZE} bytes). Download may be incomplete."
         fi
 
-        # The .sha256 file from GitHub releases contains just the hex digest (e.g., "a0b8a1eb...")
-        # awk '{print $1}' extracts it regardless of whether there's a trailing filename
+        # The .sha256 file from GitHub releases contains just the hex digest.
+        # awk '{print $1}' extracts the first whitespace-delimited field,
+        # regardless of whether there's a trailing filename in the file.
         EXPECTED=$(awk '{print $1}' "${MINIKUBE_BIN}.sha256")
         ACTUAL=$(sha256sum "${MINIKUBE_BIN}.tmp" | awk '{print $1}')
 
         # SHA256 digests are lowercase by convention; comparison is case-sensitive
         if [ "$EXPECTED" != "$ACTUAL" ]; then
+            # rm -f removes files without prompting and ignores "not found".
             rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
             fail "minikube checksum verification FAILED. Expected: ${EXPECTED}, Got: ${ACTUAL}"
         fi
 
-        # Defense-in-depth: also verify against hardcoded expected hash
+        # SUPPLY-CHAIN: the downloaded .sha256 protects against transport
+        # corruption, but it comes from the SAME release/CDN as the binary —
+        # a compromised release would substitute both. The PINNED hash in
+        # this file is the anchor to what this package was built against,
+        # so a mismatch here is FATAL (it means tampering or an unnoticed
+        # republish), not a warning.
         if [ "$EXPECTED" != "$MINIKUBE_SHA256" ]; then
-            warn "minikube checksum does not match hardcoded expected hash (version may have changed)."
-            warn "Expected: ${MINIKUBE_SHA256}"
-            warn "Got:      ${EXPECTED}"
-            # Non-fatal: the downloaded checksum already matched the binary
+            rm -f "${MINIKUBE_BIN}.tmp" "${MINIKUBE_BIN}.sha256"
+            fail "minikube binary does not match the PINNED checksum. Expected: ${MINIKUBE_SHA256}, Got: ${EXPECTED}. Possible tampering or re-published release — refusing to install."
         fi
 
         mv "${MINIKUBE_BIN}.tmp" "$MINIKUBE_BIN"
@@ -382,16 +619,18 @@ download_binaries() {
         success "minikube ${MINIKUBE_VERSION} installed and verified at ${MINIKUBE_BIN}."
     fi
 
-    # Check if kubectl is already installed at the correct version
+    # Check if kubectl is already installed at the correct version.
+    # SUPPLY-CHAIN: same rule as the minikube path — a binary's own version
+    # output is self-reported and cannot be trusted, so an installed kubectl
+    # is ALWAYS re-hashed against the pinned KUBECTL_SHA256; only the
+    # DOWNLOAD is skipped when it matches.
     if [ -x "$KUBECTL_BIN" ]; then
-        INSTALLED_VERSION=$("$KUBECTL_BIN" version --client --short 2>/dev/null | awk '{print $3}' | sed 's/^v//' || echo "")
-        if [ "$INSTALLED_VERSION" = "${KUBECTL_VERSION#v}" ]; then
-            info "kubectl ${KUBECTL_VERSION} already installed — skipping download."
+        INSTALLED_KUBECTL_SHA=$(sha256sum "$KUBECTL_BIN" 2>/dev/null | awk '{print $1}')
+        if [ "$INSTALLED_KUBECTL_SHA" = "$KUBECTL_SHA256" ]; then
+            info "kubectl ${KUBECTL_VERSION} installed, pinned checksum verified — skipping download."
             SKIP_KUBECTL=1
         else
-            if [ -n "$INSTALLED_VERSION" ]; then
-                info "kubectl ${INSTALLED_VERSION} installed, upgrading to ${KUBECTL_VERSION}..."
-            fi
+            info "Existing kubectl binary failed checksum — re-downloading ${KUBECTL_VERSION}."
             SKIP_KUBECTL=0
         fi
     else
@@ -412,12 +651,27 @@ download_binaries() {
         curl -fsSL --max-time 10 -o "${KUBECTL_BIN}.sha256" "$KUBECTL_SHA_URL" \
             || fail "Failed to download kubectl checksum."
 
+        # Same sanity checks as the minikube path: a non-empty checksum file
+        # (-s) and a well-formed 64-hex digest (-E regex) before trusting it.
+        if [ ! -s "${KUBECTL_BIN}.sha256" ] || ! grep -qE '^[a-f0-9]{64}$' "${KUBECTL_BIN}.sha256"; then
+            rm -f "${KUBECTL_BIN}.tmp" "${KUBECTL_BIN}.sha256"
+            fail "kubectl checksum file is empty or not a valid SHA256 digest."
+        fi
+
         EXPECTED=$(awk '{print $1}' "${KUBECTL_BIN}.sha256")
         ACTUAL=$(sha256sum "${KUBECTL_BIN}.tmp" | awk '{print $1}')
 
         if [ "$EXPECTED" != "$ACTUAL" ]; then
             rm -f "${KUBECTL_BIN}.tmp" "${KUBECTL_BIN}.sha256"
             fail "kubectl checksum verification FAILED. Expected: ${EXPECTED}, Got: ${ACTUAL}"
+        fi
+
+        # SUPPLY-CHAIN: same as minikube — the downloaded .sha256 comes from
+        # the same origin as the binary, so a mismatch against the PINNED
+        # hash is FATAL (tampering or republish), not a warning.
+        if [ "$EXPECTED" != "$KUBECTL_SHA256" ]; then
+            rm -f "${KUBECTL_BIN}.tmp" "${KUBECTL_BIN}.sha256"
+            fail "kubectl binary does not match the PINNED checksum. Expected: ${KUBECTL_SHA256}, Got: ${EXPECTED}. Possible tampering or re-published release — refusing to install."
         fi
 
         mv "${KUBECTL_BIN}.tmp" "$KUBECTL_BIN"
@@ -443,24 +697,186 @@ enable_lingering() {
 }
 
 # -----------------------------------------------------------------------------
-# 7b. Install management scripts
+# 7a. Install management scripts
 # -----------------------------------------------------------------------------
 
 install_management_scripts() {
     info "Ensuring management scripts are executable..."
 
-    local scripts="baize-kube-add-consumer baize-kube-remove-consumer baize-kube-list-consumers baize-kube-update-kubeconfig"
+    local scripts="baize-kube-add-consumer baize-kube-remove-consumer baize-kube-list-consumers baize-kube-update-kubeconfig baize-kube-help baize-kube-update-admin-kubeconfig"
     local script
 
     for script in $scripts; do
-        if [ -f "/usr/local/bin/${script}" ]; then
-            chmod 755 "/usr/local/bin/${script}"
-            chown root:root "/usr/local/bin/${script}"
+        if [ -f "/usr/bin/${script}" ]; then
+            chmod 755 "/usr/bin/${script}"
+            chown root:root "/usr/bin/${script}"
             success "Verified ${script}."
         else
-            warn "Management script '${script}' not found at /usr/local/bin/${script} — skipping."
+            warn "Management script '${script}' not found at /usr/bin/${script} — skipping."
         fi
     done
+}
+
+# -----------------------------------------------------------------------------
+# 7b. Validate podman machine sizing overrides
+# -----------------------------------------------------------------------------
+
+# Guards the BAIZE_KUBE_MACHINE_CPUS / BAIZE_KUBE_MACHINE_MEMORY overrides.
+# Runs BEFORE any machine is created so a typo (e.g. "four") fails fast with
+# a clear message instead of surfacing deep inside `podman machine init`.
+validate_machine_sizing() {
+    # ^[0-9]+$ anchored ERE: the value must be one or more digits and
+    # NOTHING else. Quoting "$PODMAN_MACHINE_CPUS" inside [[ ]] is required —
+    # an unquoted empty variable would make the regex match anything.
+    # To learn more, look up "[[ ... ]]" and "Conditional Expressions"
+    # in `man bash`.
+    if ! [[ "$PODMAN_MACHINE_CPUS" =~ ^[0-9]+$ ]]; then
+        fail "BAIZE_KUBE_MACHINE_CPUS='${PODMAN_MACHINE_CPUS}' is not a number. Use e.g. BAIZE_KUBE_MACHINE_CPUS=2"
+    fi
+    if ! [[ "$PODMAN_MACHINE_MEMORY" =~ ^[0-9]+$ ]]; then
+        fail "BAIZE_KUBE_MACHINE_MEMORY='${PODMAN_MACHINE_MEMORY}' is not a number (MiB). Use e.g. BAIZE_KUBE_MACHINE_MEMORY=4096"
+    fi
+
+    # -lt = numeric "less than". CPU minimum is minikube's documented
+    # requirement. The memory floor must fit minikube's 3072 MiB suggested
+    # node allocation PLUS ~1 GiB of Fedora CoreOS guest OS — a 3072 MiB
+    # machine would hand the node container the VM's entire RAM.
+    if [ "$PODMAN_MACHINE_CPUS" -lt 2 ]; then
+        fail "BAIZE_KUBE_MACHINE_CPUS=${PODMAN_MACHINE_CPUS} is below minikube's minimum of 2."
+    fi
+    if [ "$PODMAN_MACHINE_MEMORY" -lt 4096 ]; then
+        fail "BAIZE_KUBE_MACHINE_MEMORY=${PODMAN_MACHINE_MEMORY} MiB is too small (the node needs minikube's 3072 MiB suggested allocation plus ~1 GiB guest OS; floor is 4096 MiB)."
+    fi
+
+    # Human-readable summary so the admin sees the effective values early.
+    info "Podman machine sizing: ${PODMAN_MACHINE_CPUS} CPU(s), ${PODMAN_MACHINE_MEMORY} MiB memory, ${PODMAN_MACHINE_DISK} GiB disk."
+}
+
+# -----------------------------------------------------------------------------
+# 7c. Create the dedicated podman machine for minikube
+# -----------------------------------------------------------------------------
+
+# minikube's podman driver needs a working rootless podman service. We give
+# the baize user a dedicated QEMU-accelerated podman machine ("minikube")
+# and point the podman client at its API socket via CONTAINER_HOST.
+# `--update-connection` (-u) also sets the machine as the user's default
+# podman system connection.
+setup_podman_machine() {
+    info "Provisioning podman machine '${PODMAN_MACHINE_NAME}'..."
+
+    # runuser -l baize -s /bin/bash -c "..." — run a command AS the baize
+    # user with a login-like environment. The podman machine belongs to
+    # baize, so all machine operations must run as baize (rootless only).
+    # Inside the double-quoted string we need baize's OWN id -u result at
+    # RUNTIME, so we write \$(id -u) — the backslash DEFERS the expansion:
+    # our ${...} here expands NOW (as root), \$(...) expands LATER (as baize).
+    # To learn more, look up "quoting" and "escape character" in `man bash`.
+    #
+    # Idempotency: grep -qx matches whole LINES exactly (-x) and quietly
+    # (-q); if "minikube" is listed, the machine exists. But "exists" is
+    # not enough: a machine left STOPPED (e.g. after a remove/reinstall,
+    # or an interrupted install) has no API socket, and the preflight
+    # check below would fail the whole install. So in the exists-branch
+    # we also idempotently START it: `podman machine start` on an
+    # already-running machine errors out, hence the `|| true` tolerance
+    # (the same trick the unit's ExecStartPre '-' prefix uses).
+    if runuser -l "$BAIZE_USER" -s /bin/bash -c "
+        export HOME=${BAIZE_HOME}
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        ${PODMAN_BIN} machine ls --format '{{.Name}}' 2>/dev/null
+    " 2>/dev/null | grep -qx "$PODMAN_MACHINE_NAME"; then
+        info "Podman machine '${PODMAN_MACHINE_NAME}' already exists — ensuring it is running..."
+        runuser -l "$BAIZE_USER" -s /bin/bash -c "
+            export HOME=${BAIZE_HOME}
+            export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+            ${PODMAN_BIN} machine start ${PODMAN_MACHINE_NAME} 2>/dev/null || true
+        " 2>/dev/null || true
+        return 0
+    fi
+
+    # podman machine init flags: --cpus, --memory (MiB), --disk-size (GiB),
+    # --now (also start immediately), --update-connection (set as default
+    # podman connection for this user). The machine downloads a ~600 MB
+    # Fedora CoreOS image on first init — this is the slowest install step.
+    runuser -l "$BAIZE_USER" -s /bin/bash -c "
+        export HOME=${BAIZE_HOME}
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        ${PODMAN_BIN} machine init \
+            --cpus ${PODMAN_MACHINE_CPUS} \
+            --memory ${PODMAN_MACHINE_MEMORY} \
+            --disk-size ${PODMAN_MACHINE_DISK} \
+            --now \
+            --update-connection \
+            ${PODMAN_MACHINE_NAME}
+    " || fail "podman machine init failed. Check: sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) podman machine ls"
+
+    success "Podman machine '${PODMAN_MACHINE_NAME}' created and started."
+}
+
+# -----------------------------------------------------------------------------
+# 7d. Verify the podman machine API socket is reachable
+# -----------------------------------------------------------------------------
+
+verify_podman_preflight() {
+    # Resolve baize's numeric UID once and reuse it. `local uid` then
+    # `uid=$(...)` on the next line (not combined) is deliberate: with
+    # `local uid=$(cmd)`, the command substitution's exit status is hidden
+    # by `local`'s own success, breaking `set -e` error detection.
+    local uid
+    uid=$(id -u "$BAIZE_USER")
+    local socket="unix:///run/user/${uid}/podman/${PODMAN_MACHINE_NAME}-api.sock"
+
+    info "Verifying podman machine API socket (${socket})..."
+
+    # -S = "file exists AND is a Unix socket" test operator — exactly what
+    # we need, since the podman API endpoint is a socket, not a plain file.
+    if [ ! -S "/run/user/${uid}/podman/${PODMAN_MACHINE_NAME}-api.sock" ]; then
+        fail "Podman machine API socket not found at ${socket}. Run: sudo -u baize env XDG_RUNTIME_DIR=/run/user/${uid} podman machine start ${PODMAN_MACHINE_NAME}"
+    fi
+
+    # `podman info` exercises the full client->socket->machine path; if it
+    # answers, minikube's podman driver has a working endpoint.
+    runuser -l "$BAIZE_USER" -s /bin/bash -c "
+        export HOME=${BAIZE_HOME}
+        export XDG_RUNTIME_DIR=/run/user/${uid}
+        export CONTAINER_HOST=${socket}
+        ${PODMAN_BIN} info > /dev/null
+    " || fail "podman info failed against machine socket. Check: sudo -u baize env XDG_RUNTIME_DIR=/run/user/${uid} podman machine inspect ${PODMAN_MACHINE_NAME}"
+
+    success "Podman machine API socket is reachable."
+}
+
+# -----------------------------------------------------------------------------
+# 7e. Install shell completions for minikube and kubectl
+# -----------------------------------------------------------------------------
+
+install_completions() {
+    info "Installing bash completions for minikube and kubectl..."
+
+    # -d = "file exists AND is a directory" test operator.
+    if [ ! -d "$BASH_COMPLETION_DIR" ]; then
+        warn "Directory ${BASH_COMPLETION_DIR} does not exist (bash-completion not installed?) — skipping."
+        # return 0 not fail: completions are a nicety, not a hard requirement.
+        return 0
+    fi
+
+    # `minikube completion bash` prints a completion script to stdout, which
+    # we redirect into the system-wide completion dir — bash-completion
+    # sources every file there for interactive shells. Regenerated on every
+    # run so it always matches the installed binary version.
+    if ! "$MINIKUBE_BIN" completion bash > "${BASH_COMPLETION_DIR}/minikube" 2>/dev/null; then
+        warn "Failed to generate minikube bash completion — skipping."
+    else
+        chmod 644 "${BASH_COMPLETION_DIR}/minikube"
+        success "minikube bash completion installed at ${BASH_COMPLETION_DIR}/minikube."
+    fi
+
+    if ! "$KUBECTL_BIN" completion bash > "${BASH_COMPLETION_DIR}/kubectl" 2>/dev/null; then
+        warn "Failed to generate kubectl bash completion — skipping."
+    else
+        chmod 644 "${BASH_COMPLETION_DIR}/kubectl"
+        success "kubectl bash completion installed at ${BASH_COMPLETION_DIR}/kubectl."
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -473,6 +889,7 @@ configure_minikube() {
     runuser -l "$BAIZE_USER" -s /bin/bash -c "
         export HOME=${BAIZE_HOME}
         export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        export CONTAINER_HOST=unix:///run/user/\$(id -u)/podman/${PODMAN_MACHINE_NAME}-api.sock
         minikube config set driver podman
         minikube config set rootless true
         minikube config set container-runtime containerd
@@ -488,23 +905,62 @@ configure_minikube() {
 install_service() {
     info "Installing minikube systemd user service for '${BAIZE_USER}'..."
 
+    local uid
+    uid=$(id -u "$BAIZE_USER")
+
     mkdir -p "$MINIKUBE_SERVICE_DIR"
+    # chown -R changes owner recursively — the whole .config tree must
+    # belong to baize because ITS user manager reads the unit, not root's.
     chown -R "${BAIZE_USER}:${BAIZE_GROUP}" "${BAIZE_HOME}/.config"
 
+    # Here-doc with UNQUOTED EOF: $uid, ${MINIKUBE_BIN}, ... are expanded by
+    # THIS script before cat writes the file — so the finished unit has the
+    # real values baked in (no shell evaluation left for systemd to do).
     cat > "$MINIKUBE_SERVICE" <<EOF
 [Unit]
 Description=minikube Kubernetes cluster
-After=network-online.target
-Wants=network-online.target
+# NETWORK ORDERING: network-online.target does NOT exist in the user
+# manager (verified on Debian trixie) — After=/Wants= on it would be a
+# silent no-op and the unit would race host networking. podman ships a
+# user-level unit that polls the SYSTEM network-online.target; ordering
+# against it gives the waiting we actually need.
+# To learn more, look up "systemd.target" unit types in 'man 5 systemd.target'.
+After=podman-user-wait-network-online.service
+Wants=podman-user-wait-network-online.service
 
 [Service]
+# Type=oneshot + RemainAfterExit: the process runs once at start; systemd
+# then considers the unit "active" even with no process left. ExecStop runs
+# on shutdown/stop. This is the idiomatic unit type for "start a thing,
+# keep it" services like this one.
 Type=oneshot
 RemainAfterExit=yes
 Environment=HOME=${BAIZE_HOME}
 Environment=MINIKUBE_ROOTLESS=true
-ExecStart=${MINIKUBE_BIN} start --driver=podman --no-vtx-check
+# Point the podman client at the machine's API socket. minikube's podman
+# driver shells out to podman, which reads CONTAINER_HOST to find its server.
+Environment=CONTAINER_HOST=unix:///run/user/${uid}/podman/${PODMAN_MACHINE_NAME}-api.sock
+# The leading '-' means "ignore failures": if the machine is already
+# running, 'podman machine start' exits non-zero, and that must not abort
+# the service start. (It must still START a stopped machine at boot.)
+ExecStartPre=-${PODMAN_BIN} machine start ${PODMAN_MACHINE_NAME}
+ExecStart=${MINIKUBE_BIN} start --driver=podman --container-runtime=containerd
 ExecStop=${MINIKUBE_BIN} stop
-TimeoutStartSec=300
+# CLEAN VM SHUTDOWN: the QEMU process outlives ExecStartPre (podman
+# releases it into this unit's cgroup). Without this line, systemd would
+# SIGTERM the cgroup on every unit stop/host shutdown — an unclean VM
+# poweroff that risks guest-filesystem corruption over time. ExecStopPost
+# (leading '-' = tolerant) asks QEMU for an ACPI powerdown via QMP.
+ExecStopPost=-${PODMAN_BIN} machine stop ${PODMAN_MACHINE_NAME}
+# Machine boot (~30s) + cluster start can exceed the default 90s timeout.
+TimeoutStartSec=600
+# Stop-side budget: each Exec* command gets its own full TimeoutStopSec,
+# and the enclosing user@.service has TimeoutStopSec=120s on Debian —
+# the system manager SIGKILLs the whole user slice after that. 90s per
+# command keeps minikube stop + the QMP powerdown inside the outer budget
+# (realistic totals: 10-40s each on a Pi), preserving the CLEAN shutdown
+# the ExecStopPost exists for.
+TimeoutStopSec=90
 
 [Install]
 WantedBy=default.target
@@ -512,7 +968,9 @@ EOF
 
     chown "${BAIZE_USER}:${BAIZE_GROUP}" "$MINIKUBE_SERVICE"
 
-    # Enable the service as the baize user
+    # Enable the service as the baize user. `systemctl --user` talks to the
+    # USER's systemd manager (user@<uid>.service), not the system manager —
+    # hence all the runuser/XDG_RUNTIME_DIR setup around it.
     runuser -l "$BAIZE_USER" -s /bin/bash -c "
         export HOME=${BAIZE_HOME}
         export XDG_RUNTIME_DIR=/run/user/\$(id -u)
@@ -530,22 +988,28 @@ EOF
 start_cluster() {
     info "Starting minikube cluster as '${BAIZE_USER}' (this may take several minutes)..."
 
+    # First boot downloads the minikube node image into the podman machine —
+    # expect several minutes on a Pi.
     runuser -l "$BAIZE_USER" -s /bin/bash -c "
         export HOME=${BAIZE_HOME}
         export XDG_RUNTIME_DIR=/run/user/\$(id -u)
         export MINIKUBE_ROOTLESS=true
-        ${MINIKUBE_BIN} start --driver=podman --no-vtx-check
-    " || fail "minikube failed to start. Check: sudo -u baize minikube logs"
+        export CONTAINER_HOST=unix:///run/user/\$(id -u)/podman/${PODMAN_MACHINE_NAME}-api.sock
+        ${MINIKUBE_BIN} start --driver=podman --container-runtime=containerd
+    " || fail "minikube failed to start. Check: sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) CONTAINER_HOST=unix:///run/user/$(id -u baize)/podman/${PODMAN_MACHINE_NAME}-api.sock minikube logs"
 
     success "minikube cluster started."
 
-    # Verify the API server is responding before proceeding
+    # Poll the API server until it answers. `seq 1 30` prints 1..30; we only
+    # need the loop count, so we discard the value into the throwaway
+    # variable _ (a common shell convention for "ignored").
     info "Verifying cluster is healthy..."
     for _ in $(seq 1 30); do
         if runuser -l "$BAIZE_USER" -s /bin/bash -c "
             export HOME=${BAIZE_HOME}
             export XDG_RUNTIME_DIR=/run/user/\$(id -u)
             export MINIKUBE_ROOTLESS=true
+            export CONTAINER_HOST=unix:///run/user/\$(id -u)/podman/${PODMAN_MACHINE_NAME}-api.sock
             ${KUBECTL_BIN} get nodes --request-timeout=5s 2>/dev/null
         "; then
             success "Cluster API server is responding."
@@ -553,7 +1017,11 @@ start_cluster() {
         fi
         sleep 2
     done
-    fail "Cluster started but API server did not become healthy within 60 seconds."
+    # 30 iterations x (up to 5s request timeout + 2s sleep) = up to ~3.5
+    # minutes of polling, not 60s — state the real budget so operators
+    # reading the log are not misled, and point at the recovery command
+    # (dpkg leaves the package Half-Configured on this failure).
+    fail "Cluster started but API server did not become healthy within ~3.5 minutes of polling. Check 'sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) CONTAINER_HOST=unix:///run/user/$(id -u baize)/podman/${PODMAN_MACHINE_NAME}-api.sock minikube logs', fix, then re-run: sudo dpkg --configure baize-kube"
 }
 
 # -----------------------------------------------------------------------------
@@ -567,17 +1035,32 @@ provision_kubeconfig() {
     chown "root:${ADMINS_GROUP}" /etc/baize-kube
     chmod 750 /etc/baize-kube
 
-    # Write kubeconfig to a temp location the baize user can access,
-    # then move it to the admin directory as root.
-    local tmp_kubeconfig="/tmp/baize-kube-admin-kubeconfig.$$"
-    runuser -l "$BAIZE_USER" -s /bin/bash -c "
+    # SECURITY: the admin kubeconfig embeds full cluster-admin client
+    # credentials. A previous version staged it in /tmp — world-readable
+    # for the seconds `minikube kubectl` takes, on a predictable
+    # (symlink-attackable) path. Instead we redirect the runuser output
+    # straight into the final 0750 root:baize-admins directory, under
+    # umask 077 (subshell), so the file is 0600 from its first byte and
+    # there is never a world-readable window or /tmp exposure.
+    ( umask 077
+      runuser -l "$BAIZE_USER" -s /bin/bash -c "
         export HOME=${BAIZE_HOME}
         export XDG_RUNTIME_DIR=/run/user/\$(id -u)
         export MINIKUBE_ROOTLESS=true
-        ${MINIKUBE_BIN} kubectl -- config view --flatten > ${tmp_kubeconfig}
-    " || fail "Failed to export admin kubeconfig."
-    mv "$tmp_kubeconfig" "$ADMIN_KUBECONFIG"
+        export CONTAINER_HOST=unix:///run/user/\$(id -u)/podman/${PODMAN_MACHINE_NAME}-api.sock
+        ${MINIKUBE_BIN} kubectl -- config view --flatten
+    " > "$ADMIN_KUBECONFIG"
+    ) || { rm -f "$ADMIN_KUBECONFIG"; fail "Failed to export admin kubeconfig."; }
 
+    # -s = "exists and non-empty": a zero-exit minikube that emitted nothing
+    # must not ship an empty 0640 admin kubeconfig as "success".
+    if [ ! -s "$ADMIN_KUBECONFIG" ]; then
+        rm -f "$ADMIN_KUBECONFIG"
+        fail "Exported admin kubeconfig is empty — minikube may not be fully started."
+    fi
+
+    # root:baize-admins 0640: root can edit, every admin can READ, everyone
+    # else gets nothing. This file grants full cluster control — protect it.
     chown "root:${ADMINS_GROUP}" "$ADMIN_KUBECONFIG"
     chmod 640 "$ADMIN_KUBECONFIG"
 
@@ -594,10 +1077,15 @@ provision_kubeconfig() {
 
 install_profile_hint() {
     PROFILE_SNIPPET="/etc/profile.d/baize-kube.sh"
+    # <<'PROFILEEOF' — the QUOTED here-doc marker disables ALL expansion,
+    # so the script text is written verbatim (we want the literal $USER etc.
+    # to survive into the installed file and be evaluated at login time).
     cat > "$PROFILE_SNIPPET" <<'PROFILEEOF'
 # baize-kube: set KUBECONFIG for cluster admins
 # Admins get full access via the admin kubeconfig.
 # Consumers use kubectl's default location (~/.kube/config).
+# id -nG lists the user's group NAMES only (-n suppresses ids, -G means
+# groups); grep -qw checks whole-word membership.
 if id -nG "$USER" 2>/dev/null | grep -qw "baize-admins"; then
     export KUBECONFIG=/etc/baize-kube/admin-kubeconfig
 fi
@@ -609,52 +1097,121 @@ PROFILEEOF
 }
 
 # -----------------------------------------------------------------------------
+# Final summary banner
+# -----------------------------------------------------------------------------
+
+# The banner uses printf instead of echo because printf can PAD text to a
+# fixed width: the format "%-58s" left-aligns (-) the argument in a field
+# of at least 58 characters. Padding to an exact width keeps every line's
+# right border ║ perfectly aligned, no matter the text length — fixing the
+# tab-drift the old hand-spaced banner had. To learn more, look up
+# "printf" in `man bash` / `man 1 printf`.
+
+# Regular info line, padded to 58 chars then wrapped in borders.
+banner_line() { printf '║ %-58s ║\n' "$1"; }
+# Empty spacer row inside the borders.
+banner_blank() { printf '║ %-58s ║\n' ""; }
+# Indented command row: 2 spaces of indent + command padded to 56.
+banner_cmd()   { printf '║   %-56s ║\n' "$1"; }
+
+show_summary_banner() {
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    banner_line "baize-kube installation complete"
+    banner_blank
+    banner_line "Cluster owner:    baize user (locked, no interactive login)"
+    banner_line "Admins:           members of 'baize-admins' group"
+    banner_line "Consumers:        members of 'baize-consumers' group"
+    banner_line "Admin kubeconfig: /etc/baize-kube/admin-kubeconfig"
+    banner_line "Podman machine:   '${PODMAN_MACHINE_NAME}' (QEMU, ${PODMAN_MACHINE_CPUS}CPU/${PODMAN_MACHINE_MEMORY}MB/${PODMAN_MACHINE_DISK}GB)"
+    banner_line "Versions:         minikube ${MINIKUBE_VERSION}, kubectl ${KUBECTL_VERSION}"
+    banner_blank
+    banner_line "QUICK TEST (as any admin, after logging out and back in):"
+    banner_cmd "kubectl get nodes"
+    banner_blank
+    banner_line "Run a one-shot busybox pod (auto-deleted afterwards):"
+    # In a double-quoted shell string "\\" prints a single backslash —
+    # it visually continues the command onto the next banner line.
+    banner_cmd "kubectl run baize-test --image=busybox:latest \\"
+    banner_cmd "  --rm -it --restart=Never -- echo OK"
+    banner_line "  (--rm deletes the pod after it exits, -it = interactive)"
+    banner_blank
+    banner_line "MANAGE USERS:"
+    banner_cmd "sudo baize-kube-add-consumer <username>   # grant access"
+    banner_cmd "sudo baize-kube-list-consumers            # list users"
+    banner_cmd "baize-kube-help                           # full guide"
+    banner_blank
+    banner_line "SERVICE OPERATIONS (set X to the baize uid, e.g. 1001):"
+    banner_cmd "sudo -u baize env XDG_RUNTIME_DIR=/run/user/X \\"
+    banner_cmd "  systemctl --user status minikube"
+    banner_line "  (baize-kube-help section 5 has a ready-made bk alias)"
+    banner_blank
+    banner_line "Docs: /usr/share/doc/baize-kube/  (or: baize-kube-help)"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+}
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
-# Only run full installation on 'configure'
-ACTION="${1:-}"
-if [ "$ACTION" != "configure" ] && [ -n "$ACTION" ]; then
-    # For abort-upgrade, abort-remove, etc. — nothing to do
-    exit 0
+main() {
+    # "${1:-}" = first argument, or empty string if none — the :- default
+    # keeps `set -u` happy when dpkg calls us with no arguments at all.
+    local action="${1:-}"
+
+    # Debian Policy 6.9: maintainer scripts must fail on unexpected
+    # parameters. dpkg only ever calls postinst with "configure" (plus
+    # optionally a version on upgrades/reconfigures). Anything else —
+    # INCLUDING an empty $1 — must abort rather than accidentally
+    # provision a Kubernetes cluster. The case pattern ''|*) catches both.
+    # Debian Policy 6.5/6.6: dpkg also calls postinst during error UNWIND:
+    # "abort-upgrade <new-version>", "abort-remove", "abort-deconfigure".
+    # Those must exit 0 — failing them tells dpkg the unwind itself failed
+    # and degrades the package state further. This script does no work
+    # before its guard, so unwinding is trivially a no-op.
+    # An empty $1 (never happens via dpkg) still fails fast per Policy 6.9.
+    case "$action" in
+        configure) ;;
+        abort-upgrade|abort-remove|abort-deconfigure|abort-install) exit 0 ;;
+        ''|*)
+            echo "postinst called with unknown argument '${action}'" >&2
+            exit 1
+            ;;
+    esac
+
+    # The steps run in dependency order: each assumes the ones above it.
+    # System-level prerequisites (cgroups) come first, then the user, then
+    # tooling, then the podman machine, then the cluster on top of it.
+    require_root
+    check_network
+    check_and_patch_cgroup
+    configure_cgroup_delegation
+    provision_user
+    consumer_selection
+    download_binaries
+    install_management_scripts
+    install_completions
+    enable_lingering
+    link_podman_helpers
+    validate_machine_sizing
+    setup_podman_machine
+    verify_podman_preflight
+    configure_minikube
+    install_service
+    start_cluster
+    provision_kubeconfig
+    install_profile_hint
+
+    show_summary_banner
+}
+
+# EXECUTION GUARD — the standard "library or program?" pattern.
+# $0 is the name of the script being EXECUTED; BASH_SOURCE[0] is the file
+# being read. They are equal only when this file runs as a program (dpkg
+# calling ./postinst). When a test does `source postinst`, they differ and
+# we skip main() — leaving all the functions defined for the test to call
+# individually. To learn more, look up "BASH_SOURCE" in `man bash` and the
+# Bash manual's section on shell functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
 fi
-
-require_root
-check_network
-check_and_patch_cgroup
-configure_cgroup_delegation
-provision_user
-consumer_selection
-download_binaries
-install_management_scripts
-enable_lingering
-configure_minikube
-install_service
-start_cluster
-provision_kubeconfig
-install_profile_hint
-
-echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  baize-kube installation complete                           ║"
-echo "║                                                             ║"
-echo "║  Cluster owner:  baize  (locked, no interactive login)     ║"
-echo "║  Admins:         members of 'baize-admins' group           ║"
-echo "║  Consumers:      members of 'baize-consumers' group       ║"
-echo "║  Admin config:   /etc/baize-kube/admin-kubeconfig          ║"
-echo "║                                                             ║"
-echo "║  Admins: log out and back in, then run:                    ║"
-echo "║    kubectl get nodes                                        ║"
-echo "║                                                             ║"
-echo "║  To provision a consumer:                                   ║"
-echo "║    sudo baize-kube-add-consumer <username>                  ║"
-echo "║                                                             ║"
-echo "║  To list provisioned consumers:                             ║"
-echo "║    sudo baize-kube-list-consumers                           ║"
-echo "║                                                             ║"
-echo "║  To reconfigure minikube:                                   ║"
-echo "║    sudo -u baize minikube <command>                        ║"
-echo "║                                                             ║"
-echo "║  To check service status:                                   ║"
-echo "║    sudo -u baize systemctl --user status minikube          ║"
-echo "╚══════════════════════════════════════════════════════════════╝"

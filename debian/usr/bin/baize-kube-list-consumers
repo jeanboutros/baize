@@ -14,6 +14,7 @@ set -euo pipefail
 ADMIN_KUBECONFIG="/etc/baize-kube/admin-kubeconfig"
 KUBECTL="/usr/local/bin/kubectl"
 
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -38,17 +39,17 @@ EOF
 validate() {
     # Check admin kubeconfig — attempt recovery if missing
     if [ ! -r "$ADMIN_KUBECONFIG" ]; then
-        # Check if minikube is running and try to regenerate
-        if command -v minikube > /dev/null 2>&1 && \
-           sudo -u baize minikube status 2>/dev/null | grep -q "Running"; then
-            info "Admin kubeconfig missing but cluster is running. Regenerating..."
-            sudo -u baize minikube kubectl -- config view --flatten 2>/dev/null | \
-                sudo tee "$ADMIN_KUBECONFIG" > /dev/null 2>&1 || true
-            if [ -f "$ADMIN_KUBECONFIG" ] && [ -s "$ADMIN_KUBECONFIG" ]; then
-                sudo chown "root:baize-admins" "$ADMIN_KUBECONFIG"
-                sudo chmod 640 "$ADMIN_KUBECONFIG"
-                success "Admin kubeconfig regenerated."
-            fi
+        # SECURITY: delegate regeneration to the hardened helper instead of
+        # piping through `sudo tee` (which truncates the destination first
+        # and inherits the ambient umask — a 0644 world-readable window
+        # for cluster-admin credentials). The helper writes under umask 077
+        # directly into the 0750 admin directory and refuses empty output.
+        # We are already root (the internal `sudo` calls were redundant).
+        # Absolute path: a polluted PATH (e.g. sudo -E) must never resolve
+        # this privileged helper to an attacker-planted lookalike.
+        if [ -x /usr/bin/baize-kube-update-admin-kubeconfig ]; then
+            info "Admin kubeconfig missing — attempting regeneration..."
+            /usr/bin/baize-kube-update-admin-kubeconfig 2>/dev/null || true
         fi
 
         # If still missing after recovery attempt, fail with helpful message

@@ -3,7 +3,7 @@
 ## Installation
 
 ```bash
-sudo dpkg -i baize-kube_1.0_arm64.deb
+sudo dpkg -i baize-kube_<version>_arm64.deb
 ```
 
 If the cgroup memory controller is not yet active, the installer will patch `/boot/firmware/cmdline.txt`, exit with code 1 (leaving the package in "Half-Configured" state), and display instructions to reboot:
@@ -34,9 +34,15 @@ cat /sys/fs/cgroup/cgroup.controllers
 # Expected: cpuset cpu io memory pids
 ```
 
+**Check the podman machine (the cluster node runs inside it):**
+```bash
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) podman machine ls
+# Expected: machine "minikube" in state "Running"
+```
+
 **Check baize user service is running:**
 ```bash
-sudo -u baize systemctl --user status minikube
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) systemctl --user status minikube
 ```
 
 **Check the cluster is up (as a consumer):**
@@ -77,47 +83,82 @@ kubectl get pods --all-namespaces
 
 ### Check minikube service logs
 ```bash
-sudo -u baize journalctl --user -u minikube -f
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) journalctl --user -u minikube -f
 ```
 
 ### Check minikube status
 ```bash
-sudo -u baize minikube status
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) minikube status
 ```
 
 ---
 
 ## Cluster administration (as an admin via sudo)
 
-All minikube reconfiguration must be done as `baize`. The `sudo -u baize` pattern preserves audit logging.
+All minikube reconfiguration must be done as `baize`, with its runtime
+environment (`XDG_RUNTIME_DIR` and `CONTAINER_HOST` — the latter points
+at the podman machine's API socket). Typing both every time is tedious,
+so define a wrapper function in your shell first:
+
+```bash
+bk() { sudo -u baize env \
+    XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+    CONTAINER_HOST=unix:///run/user/$(id -u baize)/podman/minikube-api.sock \
+    "$@"; }
+```
+
+(`baize-kube-help` section 5 documents this too. The `sudo -u baize`
+pattern preserves audit logging; everything below assumes the `bk`
+function is defined.)
 
 ### Enable a minikube addon
 ```bash
-sudo -u baize minikube addons enable ingress
+bk minikube addons enable ingress
 ```
 
 ### Change resource allocation
+
+minikube REFUSES memory/CPU changes for an existing cluster ("You cannot
+change the memory size for an existing minikube cluster. Please first
+delete the cluster."). The sizes involved live on two layers:
+
+- the **podman machine** (fixed at install via `BAIZE_KUBE_MACHINE_*`)
+- the **node container inside the machine** (minikube's `--memory`, which
+  must stay ~1 GiB BELOW the machine size to leave room for the guest OS)
+
+To resize the machine: remove + reinstall with different
+`BAIZE_KUBE_MACHINE_*` values (the machine is re-created):
+
 ```bash
-sudo -u baize minikube stop
-sudo -u baize minikube config set memory 6000
-sudo -u baize minikube config set cpus 3
-sudo -u baize minikube start
+sudo dpkg -r baize-kube
+sudo env BAIZE_KUBE_MACHINE_CPUS=2 BAIZE_KUBE_MACHINE_MEMORY=6144 \
+    dpkg -i baize-kube_<version>_arm64.deb
 ```
+
+To resize only the node container (machine unchanged):
+
+```bash
+bk minikube delete
+bk minikube start --memory=4096 --cpus=2
+```
+
+Never set the node memory within ~1 GiB of the machine size — the guest
+OS would be starved and the node OOM-killed.
 
 ### Access minikube dashboard
 ```bash
-sudo -u baize minikube dashboard --url
+bk minikube dashboard --url
 # Then open the URL in a browser as the consumer
 ```
 
 ### View minikube config
 ```bash
-sudo -u baize minikube config view
+bk minikube config view
 ```
 
 ### Restart the cluster manually
 ```bash
-sudo -u baize systemctl --user restart minikube
+bk systemctl --user restart minikube
 ```
 
 ---
@@ -143,26 +184,42 @@ To give another user on the system access to the cluster:
 
 ## Updating minikube and kubectl
 
-The package does not manage binary updates automatically. To update:
+The package pins both versions AND their SHA256 hashes in its postinst
+(minikube to the GitHub release, kubectl to dl.k8s.io) and refuses to
+install a binary that does not match the pin. Because of that, manual
+`curl` updates are actively harmful: an unpinned binary would make the
+next `dpkg --configure`/reinstall FAIL the hash check, and "latest"
+versions would break the deliberate kubectl↔cluster version skew
+(kubectl must match the cluster's minor version).
+
+**The supported update procedure is:**
+
+1. Bump `MINIKUBE_VERSION`, `MINIKUBE_SHA256`, `KUBECTL_VERSION`, and
+   `KUBECTL_SHA256` in the postinst (each hash is published alongside
+   the release: minikube's in the GitHub release notes/`.sha256` asset,
+   kubectl's at `https://dl.k8s.io/release/<version>/bin/linux/arm64/kubectl.sha256`).
+   ALSO update: the version-linkage comment near the pins (which minikube
+   version defaults to which Kubernetes version — verify against the
+   release notes), and the version-specific prose in doc/05.
+2. Note: an EXISTING cluster keeps its old Kubernetes version after a
+   binary-only upgrade (one minor of skew is within policy). To move the
+   cluster to the new default: `bk minikube delete && bk systemctl --user
+   start minikube`.
+3. Rebuild and reinstall the package:
 
 ```bash
-# Stop the cluster first
-sudo -u baize minikube stop
-
-# Re-download minikube
-sudo curl -fsSL -o /usr/local/bin/minikube \
-  https://github.com/kubernetes/minikube/releases/download/latest/minikube-linux-arm64
-sudo chmod +x /usr/local/bin/minikube
-
-# Re-download kubectl
-K8S_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-sudo curl -fsSL -o /usr/local/bin/kubectl \
-  "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/arm64/kubectl"
-sudo chmod +x /usr/local/bin/kubectl
-
-# Restart
-sudo -u baize systemctl --user start minikube
+make build VERSION=<new version>
+sudo dpkg -i baize-kube_<new-version>_arm64.deb
 ```
+
+The installer re-hashes any installed binary against the new pins and
+replaces it when they differ (the cluster keeps running throughout).
+
+> **Offline note:** `minikube kubectl ...` (used by the admin-kubeconfig
+> regeneration paths) does NOT use the pinned /usr/local/bin/kubectl —
+> it downloads its own copy, keyed to the cluster's version, into
+> `~baize/.minikube/cache/`. First-time regeneration therefore needs
+> network access even though kubectl is installed on disk.
 
 ---
 
@@ -170,12 +227,15 @@ sudo -u baize systemctl --user start minikube
 
 ### `kubectl` returns "connection refused"
 
-The cluster may still be starting. Check the service:
+The cluster may still be starting — the podman machine boots first
+(~30 s), then minikube pulls and starts the node image (several minutes
+on first boot). Check the service:
 ```bash
-sudo -u baize journalctl --user -u minikube --since "5 minutes ago"
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+    journalctl --user -u minikube --since "5 minutes ago"
 ```
 
-Allow up to 5 minutes on first boot.
+Allow up to 10 minutes on first boot.
 
 ### cgroup memory controller not active after reboot
 
@@ -193,14 +253,13 @@ sudo reboot
 
 ### `sudo -u baize minikube` fails with XDG_RUNTIME_DIR error
 
-The baize user's runtime directory may not be mounted. Trigger it:
-```bash
-sudo machinectl shell baize@
-# This starts a proper login session for baize
-exit
-```
+`sudo -u baize` (unlike `runuser -l`) does NOT create a login session, so
+`XDG_RUNTIME_DIR` is never set. That is why every example in this
+document uses the `bk` wrapper (or `sudo -u baize env XDG_RUNTIME_DIR=...`)
+— plain `sudo -u baize minikube ...` will not work.
 
-Or check if lingering is enabled:
+If the runtime directory itself is missing even with the env var set,
+check that lingering is enabled:
 ```bash
 loginctl show-user baize | grep Linger
 # Expected: Linger=yes
@@ -211,41 +270,89 @@ If not:
 sudo loginctl enable-linger baize
 ```
 
+### Podman machine will not start / "missing virtiofsd" errors
+
+The installer links the helper binaries (`gvproxy`, `virtiofsd`) into
+`/usr/libexec/podman/` and adds `baize` to the `kvm` group. If podman was
+upgraded or the links were removed, verify:
+```bash
+ls -l /usr/libexec/podman/   # gvproxy and virtiofsd symlinks must exist
+ls -l /dev/kvm               # must be accessible by group kvm
+id baize                      # must list kvm in the groups
+```
+
+If anything is missing, reinstall the package (the postinst re-creates
+all of it idempotently):
+```bash
+sudo apt install --reinstall baize-kube
+```
+
 ### Volume already exists error on minikube start
 
 A previous failed start left a dangling volume:
 ```bash
-sudo -u baize podman volume rm minikube
-sudo -u baize systemctl --user start minikube
+bk podman volume rm minikube
+bk systemctl --user start minikube
 ```
 
-### Kubeconfig is stale after cluster reconfiguration
+### Kubeconfig is stale after cluster recreation
+
+The admin kubeconfig is a SNAPSHOT: its server endpoint is
+`https://127.0.0.1:<port>` where the port is a random host port assigned by
+the podman machine's port-forwarding. Whenever the minikube container is
+recreated (delete/start), that port CHANGES and every admin kubeconfig goes
+stale ("connection refused"), while `bk minikube status` still shows a
+healthy cluster. Consumer kubeconfigs keep working (their ServiceAccount
+tokens are unaffected) but their server endpoint must also be refreshed.
 
 Regenerate the admin kubeconfig:
 ```bash
-sudo baize-kube-update-kubeconfig
+sudo baize-kube-update-admin-kubeconfig
 ```
 
-This regenerates `/etc/baize-kube/admin-kubeconfig` from the current cluster state. Consumer kubeconfigs (at `~<username>/.kube/config`) are unaffected — they use per-user ServiceAccount tokens that remain valid across cluster reconfigurations.
+Then refresh each consumer kubeconfig:
+```bash
+sudo baize-kube-update-kubeconfig <username>
+```
+
+**Note on the endpoint:** the API server is reachable at `127.0.0.1` —
+LOCAL to the Pi. Admins on other machines must use an SSH tunnel
+(`ssh -L 6443:127.0.0.1:<port> pi`) or run kubectl on the Pi itself.
 
 ---
 
 ## Uninstallation
+
+### Plain remove (cluster destroyed, config preserved)
 
 ```bash
 sudo dpkg -r baize-kube
 ```
 
 This will:
-- Stop and delete the minikube cluster
+- Stop and delete the minikube cluster (and stop/remove the podman machine)
 - Disable systemd lingering for baize
 - Remove the `baize` user and home directory
-- Remove the `baize-consumers` group
-- Remove the `baize-admins` group
-- Remove `/etc/baize-kube/`
+- Remove the `baize-consumers` and `baize-admins` groups
+- Remove every consumer kubeconfig (their bearer tokens die with the cluster)
+- Remove the admin kubeconfig credential file
 - Remove `/usr/local/bin/minikube` and `/usr/local/bin/kubectl`
-- Remove the cgroup delegation config
-- Remove the shell profile snippet
+- Remove the cgroup delegation config and the shell profile snippet
+
+**Preserved for reinstall:** `/etc/baize-kube/consumers.conf` (your
+admin-authored consumer list) — postinst re-adopts it automatically on
+reinstall. Note that consumer kubeconfigs are NOT restored automatically:
+after a remove+reinstall, re-run `sudo baize-kube-add-consumer <username>`
+for each user.
+
+### Purge (everything, including the preserved config)
+
+```bash
+sudo dpkg --purge baize-kube
+```
+
+Additionally deletes `/etc/baize-kube/` (consumers.conf) and the debconf
+answers. Run this when you want no baize-kube state left on the machine.
 
 **What is NOT removed:** The `cgroup_memory=1 cgroup_enable=memory` parameters in `/boot/firmware/cmdline.txt`. These are harmless on their own but can be removed manually if desired:
 

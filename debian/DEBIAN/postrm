@@ -1,12 +1,20 @@
 #!/bin/bash
+# =============================================================================
+# baize-kube postrm — runs AFTER package files are removed.
+#
+# Cleans up everything the postinst created OUTSIDE the package tree:
+# services, the baize user and its home, groups, kubeconfigs, binaries,
+# cgroup delegation config, and the podman machine.
+# Does NOT revert the cmdline.txt patch — that needs a reboot and other
+# software may want the memory controller too; the summary box at the end
+# tells the admin how to undo it manually.
+#
+# SCRIPT SAFETY HEADER (project convention):
+#   set -e  exit on any command failure
+#   set -u  unset variables are fatal errors
+#   set -o pipefail  pipelines report the first failure, not the last
+# =============================================================================
 set -euo pipefail
-
-# =============================================================================
-# baize-kube postrm
-# Cleans up on package removal: stops services, removes user, groups, binaries,
-# kubeconfig, profile snippet, and cgroup delegation config.
-# Does NOT reverse the cmdline.txt patch — that requires an intentional reboot.
-# =============================================================================
 
 BAIZE_USER="baize"
 ADMINS_GROUP="baize-admins"
@@ -17,185 +25,306 @@ DELEGATE_CONF="/etc/systemd/system/user@.service.d/delegate.conf"
 MINIKUBE_BIN="/usr/local/bin/minikube"
 KUBECTL_BIN="/usr/local/bin/kubectl"
 PROFILE_SNIPPET="/etc/profile.d/baize-kube.sh"
-MANAGEMENT_SCRIPTS="baize-kube-add-consumer baize-kube-remove-consumer baize-kube-list-consumers baize-kube-update-kubeconfig"
+PODMAN_MACHINE_NAME="minikube"
 
 info()    { echo "[baize-kube] INFO:  $*"; }
 success() { echo "[baize-kube] OK:    $*"; }
 warn()    { echo "[baize-kube] WARN:  $*"; }
 
-# Only run full cleanup on 'remove' or 'purge', not on upgrade
-case "${1:-}" in
-    remove|purge) ;;
-    *) exit 0 ;;
-esac
+main() {
+    # Only run full cleanup on 'remove' or 'purge', not on upgrade —
+    # an upgrade must keep the cluster, its user, and all state intact
+    # so the new package version adopts them.
+    local action="${1:-}"
+    # REMOVE vs PURGE (Debian Policy 6.7 + the owner's appliance design):
+    #   remove — the cluster is torn down (services, machine, baize user,
+    #             binaries), per the owner's "remove means I don't want
+    #             the cluster anymore" intent. BUT the admin-authored
+    #             configuration in /etc/baize-kube (consumers.conf) is
+    #             PRESERVED so a later reinstall re-adopts it, and a
+    #             later purge has something left to purge.
+    #   purge  — additionally delete /etc/baize-kube entirely.
+    local is_purge=0
+    case "$action" in
+        remove) ;;
+        purge) is_purge=1 ;;
+        # `disappear` (package fully overwritten by another) skips the
+        # teardown deliberately: the files were replaced, not removed by
+        # an admin decision — the cluster state should survive for the
+        # taking-over package to adopt. upgrade/failed-upgrade/abort-*
+        # likewise no-op (Policy 6.5 unwind semantics).
+        *) exit 0 ;;
+    esac
 
-# -----------------------------------------------------------------------------
-# 1. Stop and disable minikube user service
-# -----------------------------------------------------------------------------
-
-info "Stopping minikube cluster and user service..."
-if id "$BAIZE_USER" > /dev/null 2>&1; then
-    runuser -l "$BAIZE_USER" -s /bin/bash -c "
-        export HOME=${BAIZE_HOME}
-        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
-        export MINIKUBE_ROOTLESS=true
-        systemctl --user stop minikube.service 2>/dev/null || true
-        systemctl --user disable minikube.service 2>/dev/null || true
-        ${MINIKUBE_BIN} delete --all 2>/dev/null || true
-    " 2>/dev/null || warn "Could not cleanly stop minikube service (may already be stopped)."
-    success "minikube service stopped."
-fi
-
-# -----------------------------------------------------------------------------
-# 2. Disable lingering for baize
-# -----------------------------------------------------------------------------
-
-info "Disabling systemd lingering for '${BAIZE_USER}'..."
-loginctl disable-linger "$BAIZE_USER" 2>/dev/null || true
-success "Lingering disabled."
-
-# -----------------------------------------------------------------------------
-# 3. Remove baize user and home directory
-# -----------------------------------------------------------------------------
-
-info "Removing user '${BAIZE_USER}'..."
-if id "$BAIZE_USER" > /dev/null 2>&1; then
-    userdel --remove "$BAIZE_USER" 2>/dev/null || userdel "$BAIZE_USER" 2>/dev/null || true
-    rm -rf "$BAIZE_HOME"
-    success "User '${BAIZE_USER}' and home directory removed."
-else
-    info "User '${BAIZE_USER}' does not exist — skipping."
-fi
-
-# Remove subuid/subgid entries
-sed -i "/^${BAIZE_USER}:/d" /etc/subuid 2>/dev/null || true
-sed -i "/^${BAIZE_USER}:/d" /etc/subgid 2>/dev/null || true
-success "subuid/subgid entries removed."
-
-# -----------------------------------------------------------------------------
-# 3b. Clean consumer kubeconfigs (before removing consumers.conf and group)
-# -----------------------------------------------------------------------------
-
-CONSUMERS_CONF="${KUBECONFIG_DIR}/consumers.conf"
-info "Cleaning consumer kubeconfigs..."
-if [ -f "$CONSUMERS_CONF" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-        # Strip inline comments and trim whitespace
-        line="${line%%#*}"
-        line="$(echo "$line" | xargs)"
-        [ -n "$line" ] || continue
-        consumer_kubeconfig="/home/${line}/.kube/config"
-        if [ -f "$consumer_kubeconfig" ]; then
-            rm -f "$consumer_kubeconfig"
-            info "Removed kubeconfig for consumer '${line}'."
-        fi
-    done < "$CONSUMERS_CONF"
-fi
-success "Consumer kubeconfigs cleaned."
-
-# -----------------------------------------------------------------------------
-# 4. Remove baize-consumers group
-# -----------------------------------------------------------------------------
-
-info "Removing group '${CONSUMERS_GROUP}'..."
-if getent group "$CONSUMERS_GROUP" > /dev/null 2>&1; then
-    groupdel "$CONSUMERS_GROUP" 2>/dev/null || true
-    success "Group '${CONSUMERS_GROUP}' removed."
-else
-    info "Group '${CONSUMERS_GROUP}' does not exist — skipping."
-fi
-
-# -----------------------------------------------------------------------------
-# 5. Remove kubeconfig directory
-# -----------------------------------------------------------------------------
-
-info "Removing kubeconfig directory..."
-rm -rf "$KUBECONFIG_DIR"
-success "Removed ${KUBECONFIG_DIR}."
-
-# -----------------------------------------------------------------------------
-# 6. Remove binaries
-# -----------------------------------------------------------------------------
-
-info "Removing minikube and kubectl binaries..."
-rm -f "$MINIKUBE_BIN" "$KUBECTL_BIN"
-success "Binaries removed."
-
-# -----------------------------------------------------------------------------
-# 7. Remove cgroup delegation config
-# -----------------------------------------------------------------------------
-
-info "Removing cgroup delegation config..."
-rm -f "$DELEGATE_CONF"
-# Remove the directory if it's now empty
-rmdir "$(dirname "$DELEGATE_CONF")" 2>/dev/null || true
-systemctl daemon-reload
-success "cgroup delegation config removed."
-
-# -----------------------------------------------------------------------------
-# 8. Remove shell profile snippet
-# -----------------------------------------------------------------------------
-
-info "Removing shell profile snippet..."
-rm -f "$PROFILE_SNIPPET"
-success "Profile snippet removed."
-
-# -----------------------------------------------------------------------------
-# 8b. Remove management scripts
-# -----------------------------------------------------------------------------
-
-info "Removing management scripts..."
-for script in $MANAGEMENT_SCRIPTS; do
-    if [ -f "/usr/local/bin/${script}" ]; then
-        rm -f "/usr/local/bin/${script}"
-        info "Removed /usr/local/bin/${script}."
+    # -------------------------------------------------------------------------
+    # 1. Stop and disable the minikube user service
+    # -------------------------------------------------------------------------
+    info "Stopping minikube cluster and user service..."
+    if id "$BAIZE_USER" > /dev/null 2>&1; then
+        # Each command gets `2>/dev/null || true` — removal must proceed
+        # even when the cluster is already stopped/broken.
+        runuser -l "$BAIZE_USER" -s /bin/bash -c "
+            export HOME=${BAIZE_HOME}
+            export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+            export MINIKUBE_ROOTLESS=true
+            systemctl --user stop minikube.service 2>/dev/null || true
+            systemctl --user disable minikube.service 2>/dev/null || true
+            ${MINIKUBE_BIN} delete --all 2>/dev/null || true
+        " 2>/dev/null || warn "Could not cleanly stop minikube service (may already be stopped)."
+        # The bus disable can silently no-op when no user manager is
+        # running — remove the enable symlink directly so a later
+        # lingering-start can never resurrect the unit.
+        rm -f "${BAIZE_HOME}/.config/systemd/user/default.target.wants/minikube.service" 2>/dev/null || true
+        success "minikube service stopped."
     fi
-done
-success "Management scripts removed."
 
-# -----------------------------------------------------------------------------
-# 8c. Remove baize-admins group
-# -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 2. Disable lingering for baize
+    # -------------------------------------------------------------------------
+    info "Disabling systemd lingering for '${BAIZE_USER}'..."
+    # Lingering is what made the user's services start at BOOT; turning it
+    # off ensures nothing respawns the cluster after we remove it.
+    loginctl disable-linger "$BAIZE_USER" 2>/dev/null || true
+    success "Lingering disabled."
 
-info "Removing group '${ADMINS_GROUP}'..."
-if getent group "$ADMINS_GROUP" > /dev/null 2>&1; then
-    groupdel "$ADMINS_GROUP" 2>/dev/null || true
-    success "Group '${ADMINS_GROUP}' removed."
-else
-    info "Group '${ADMINS_GROUP}' does not exist — skipping."
+    # -------------------------------------------------------------------------
+    # 2b. Remove the podman machine (before the user and its home go away)
+    # -------------------------------------------------------------------------
+    # The machine's disk image lives under baize's home — but `podman
+    # machine rm` also unregisters it, so we do it while the user and its
+    # identity still exist. Order matters: after userdel there is no baize
+    # identity left to run the removal as.
+    info "Removing podman machine '${PODMAN_MACHINE_NAME}'..."
+    if id "$BAIZE_USER" > /dev/null 2>&1 && [ -x /usr/bin/podman ]; then
+        runuser -l "$BAIZE_USER" -s /bin/bash -c "
+            export HOME=${BAIZE_HOME}
+            export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+            /usr/bin/podman machine rm -f ${PODMAN_MACHINE_NAME} 2>/dev/null || true
+        " 2>/dev/null || warn "Could not remove podman machine (may not exist)."
+        success "Podman machine removed."
+    else
+        info "baize user or podman not present — skipping machine removal."
+    fi
+
+    # -------------------------------------------------------------------------
+    # 3. Remove baize user and home directory
+    # -------------------------------------------------------------------------
+    info "Removing user '${BAIZE_USER}'..."
+    if id "$BAIZE_USER" > /dev/null 2>&1; then
+        # --remove also deletes the home directory. The fallback chain
+        # (|| userdel || true) copes with a mounted-but-busy home dir:
+        # drop the user first, then never fail the removal over it.
+        userdel --remove "$BAIZE_USER" 2>/dev/null || userdel "$BAIZE_USER" 2>/dev/null || true
+        rm -rf "$BAIZE_HOME"
+        success "User '${BAIZE_USER}' and home directory removed."
+    else
+        info "User '${BAIZE_USER}' does not exist — skipping."
+    fi
+
+    # sed -i edits the file IN-PLACE. The pattern /^${BAIZE_USER}:/d
+    # deletes (d) every line that STARTS (^) with "baize:" — anchored so a
+    # user named "baize2" is never touched. 2>/dev/null || true guards the
+    # case where the file doesn't exist at all.
+    sed -i "/^${BAIZE_USER}:/d" /etc/subuid 2>/dev/null || true
+    sed -i "/^${BAIZE_USER}:/d" /etc/subgid 2>/dev/null || true
+    success "subuid/subgid entries removed."
+
+    # -------------------------------------------------------------------------
+    # 3b. Clean consumer kubeconfigs (before consumers.conf is deleted)
+    # -------------------------------------------------------------------------
+    # Each provisioned user got a kubeconfig at ~user/.kube/config — those
+    # are useless once the cluster is gone, and they contain a token, so
+    # remove them. TWO sources of truth, because consumers.conf is not
+    # always complete: users provisioned later via baize-kube-add-consumer
+    # (the documented on-demand flow) are members of baize-consumers but
+    # never appear in the conf file. Enumerate BOTH; resolve each user's
+    # real home via getent (never assume /home/<name>).
+    # `grep -o '[^,]*'` splits the comma-separated member list; cut -d: -f4
+    # extracts members from getent's "group:x:gid:user1,user2" output.
+    clean_consumer_kubeconfig() {
+        local username="$1"
+        local user_home
+        user_home=$(getent passwd "$username" 2>/dev/null | cut -d: -f6) || true
+        [ -n "$user_home" ] || return 0
+        local consumer_kubeconfig="${user_home}/.kube/config"
+        # -f skips dangling symlinks; -e also catches symlinked configs
+        # (we own the token, deleting the link is safe and correct).
+        if [ -e "$consumer_kubeconfig" ]; then
+            rm -f "$consumer_kubeconfig"
+            info "Removed kubeconfig for consumer '${username}'."
+        fi
+    }
+
+    CONSUMERS_CONF="${KUBECONFIG_DIR}/consumers.conf"
+    info "Cleaning consumer kubeconfigs..."
+    if [ -f "$CONSUMERS_CONF" ]; then
+        # -s = file exists and is non-empty (see postinst for the read-loop
+        # idiom explanation: IFS= read -r, || [ -n "$line" ] handles a
+        # missing final newline).
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Strip inline comments (${line%%#*}), trim whitespace (xargs),
+            # skip blank lines (-n test).
+            line="${line%%#*}"
+            line="$(echo "$line" | xargs)"
+            [ -n "$line" ] || continue
+            clean_consumer_kubeconfig "$line"
+        done < "$CONSUMERS_CONF"
+    fi
+    # Group members not present in consumers.conf (provisioned on-demand).
+    if getent group "$CONSUMERS_GROUP" > /dev/null 2>&1; then
+        GROUP_MEMBERS=$(getent group "$CONSUMERS_GROUP" | cut -d: -f4)
+        for member in ${GROUP_MEMBERS//,/ }; do
+            [ -n "$member" ] || continue
+            clean_consumer_kubeconfig "$member"
+        done
+    fi
+    success "Consumer kubeconfigs cleaned."
+
+    # -------------------------------------------------------------------------
+    # 4. Remove baize-consumers group
+    # -------------------------------------------------------------------------
+    info "Removing group '${CONSUMERS_GROUP}'..."
+    if getent group "$CONSUMERS_GROUP" > /dev/null 2>&1; then
+        groupdel "$CONSUMERS_GROUP" 2>/dev/null || true
+        success "Group '${CONSUMERS_GROUP}' removed."
+    else
+        info "Group '${CONSUMERS_GROUP}' does not exist — skipping."
+    fi
+
+    # -------------------------------------------------------------------------
+    # 5. Remove kubeconfig directory (PURGE ONLY)
+    # -------------------------------------------------------------------------
+    # On plain remove we KEEP /etc/baize-kube: it holds consumers.conf,
+    # which the ADMIN authored before install and which postinst re-adopts
+    # on reinstall (Policy 6.7: local configuration survives remove).
+    # Consumer kubeconfig files were already cleaned above (they are
+    # cluster credentials and die with the cluster either way).
+    if [ "$is_purge" -eq 1 ]; then
+        info "Purging kubeconfig directory ${KUBECONFIG_DIR}..."
+        rm -rf "$KUBECONFIG_DIR"
+        success "Removed ${KUBECONFIG_DIR}."
+    else
+        # On plain remove, delete the credential file (the cluster it
+        # authenticated to is gone; keeping stale cluster-admin client
+        # keys on disk serves no one) and preserve ONLY consumers.conf.
+        info "Preserving ${KUBECONFIG_DIR}/consumers.conf for reinstall (purge to delete)."
+        # Remove the credential file AND any staging temp left by an
+        # interrupted baize-kube-update-admin-kubeconfig run (a 0600
+        # root-owned dotfile holding cluster-admin creds must not survive
+        # a remove/reinstall cycle).
+        rm -f "${KUBECONFIG_DIR}/admin-kubeconfig"
+        rm -f "${KUBECONFIG_DIR}"/.admin-kubeconfig.new.* 2>/dev/null || true
+    fi
+
+    # -------------------------------------------------------------------------
+    # 6. Remove binaries
+    # -------------------------------------------------------------------------
+    info "Removing minikube and kubectl binaries..."
+    rm -f "$MINIKUBE_BIN" "$KUBECTL_BIN"
+    success "Binaries removed."
+
+    # -------------------------------------------------------------------------
+    # 7. Remove cgroup delegation config
+    # -------------------------------------------------------------------------
+    info "Removing cgroup delegation config..."
+    rm -f "$DELEGATE_CONF"
+    # rmdir removes only EMPTY directories — if another package left a
+    # drop-in there, we keep it. `|| true` hides the "not empty" error.
+    rmdir "$(dirname "$DELEGATE_CONF")" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    success "cgroup delegation config removed."
+
+    # -------------------------------------------------------------------------
+    # 8. Remove shell profile snippet and bash completions
+    # -------------------------------------------------------------------------
+    info "Removing shell profile snippet..."
+    rm -f "$PROFILE_SNIPPET"
+    success "Profile snippet removed."
+
+    info "Removing bash completions..."
+    rm -f /etc/bash_completion.d/minikube /etc/bash_completion.d/kubectl
+    success "Bash completions removed."
+
+    # -------------------------------------------------------------------------
+    # 8b. Remove management scripts
+    # -------------------------------------------------------------------------
+    info "Management scripts..."
+    # dpkg already removed the /usr/bin payload before postrm runs —
+    # nothing to delete here (this used to hand-rm package-owned files,
+    # which dpkg had already deleted).
+    success "Management scripts removed by dpkg."
+
+    # -------------------------------------------------------------------------
+    # 8c. Remove baize-admins group
+    # -------------------------------------------------------------------------
+    info "Removing group '${ADMINS_GROUP}'..."
+    if getent group "$ADMINS_GROUP" > /dev/null 2>&1; then
+        groupdel "$ADMINS_GROUP" 2>/dev/null || true
+        success "Group '${ADMINS_GROUP}' removed."
+    else
+        info "Group '${ADMINS_GROUP}' does not exist — skipping."
+    fi
+
+    # -------------------------------------------------------------------------
+    # 9. Remove post-reboot trigger artifacts
+    # -------------------------------------------------------------------------
+    info "Removing post-reboot trigger artifacts..."
+    systemctl disable baize-kube-reboot.service 2>/dev/null || true
+    rm -f /etc/systemd/system/baize-kube-reboot.service
+    rm -f /var/lib/baize-kube/needs-reboot
+    # /usr/lib/baize-kube payload files were removed by dpkg; only the
+    # directories (dpkg leaves empty dirs to postrm) need cleanup.
+    rmdir /var/lib/baize-kube 2>/dev/null || true
+    rmdir /usr/lib/baize-kube 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    success "Post-reboot trigger artifacts removed."
+
+    # -------------------------------------------------------------------------
+    # 10. Purge debconf answers (PURGE ONLY, per debconf developer's guide)
+    # -------------------------------------------------------------------------
+    # Without this, the answer to baize-kube/consumers survives in the
+    # debconf database and silently reappears on reinstall. The guard
+    # mirrors postinst's: never source confmodule when db_* is already
+    # defined (unit tests predefine stubs).
+    if [ "$is_purge" -eq 1 ]; then
+        info "Purging debconf answers..."
+        if command -v db_purge > /dev/null 2>&1; then
+            db_purge || true
+        elif [ -f /usr/share/debconf/confmodule ]; then
+            # shellcheck source=/dev/null
+            . /usr/share/debconf/confmodule
+            db_purge || true
+        fi
+        success "Debconf answers purged."
+    fi
+
+    # -------------------------------------------------------------------------
+    # 11. Note about cmdline.txt
+    # -------------------------------------------------------------------------
+    # printf %-58s padding (same pattern as the postinst banner) keeps every
+    # right border aligned regardless of text length — the old hand-spaced
+    # echo lines had drifted to mixed widths.
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    printf '║ %-58s ║\n' "baize-kube removed"
+    printf '║ %-58s ║\n' ""
+    printf '║ %-58s ║\n' "NOTE: /boot/firmware/cmdline.txt was NOT modified."
+    printf '║ %-58s ║\n' "The cgroup_enable=memory parameter remains in place"
+    printf '║ %-58s ║\n' "to avoid conflicts with other applications that may"
+    printf '║ %-58s ║\n' "also need the memory controller."
+    printf '║ %-58s ║\n' ""
+    printf '║ %-58s ║\n' "To remove it (if no other apps need it):"
+    printf '║   %-56s ║\n' "sudo nano /boot/firmware/cmdline.txt"
+    printf '║ %-58s ║\n' ""
+    printf '║ %-58s ║\n' "Remove the following from the line, then reboot:"
+    printf '║   %-56s ║\n' "cgroup_enable=memory"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+}
+
+# EXECUTION GUARD: run main() only when executed by dpkg, not when sourced
+# by the unit tests. $0 (executed script path) equals BASH_SOURCE[0] (file
+# currently being read) only in direct execution. To learn more, look up
+# "BASH_SOURCE" in `man bash`.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
 fi
-
-# -----------------------------------------------------------------------------
-# 9. Remove post-reboot trigger artifacts
-# -----------------------------------------------------------------------------
-
-info "Removing post-reboot trigger artifacts..."
-systemctl disable baize-kube-reboot.service 2>/dev/null || true
-rm -f /etc/systemd/system/baize-kube-reboot.service
-rm -f /var/lib/baize-kube/needs-reboot
-rm -f /usr/lib/baize-kube/complete-install
-rm -f /usr/lib/baize-kube/baize-kube-reboot.service
-rmdir /var/lib/baize-kube 2>/dev/null || true
-rmdir /usr/lib/baize-kube 2>/dev/null || true
-systemctl daemon-reload
-success "Post-reboot trigger artifacts removed."
-
-# -----------------------------------------------------------------------------
-# 10. Note about cmdline.txt
-# -----------------------------------------------------------------------------
-
-echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  baize-kube removed                                         ║"
-echo "║                                                             ║"
-echo "║  NOTE: /boot/firmware/cmdline.txt was NOT modified.        ║"
-echo "║  The cgroup_memory=1 cgroup_enable=memory parameters       ║"
-echo "║  remain in place to avoid conflicts with other             ║"
-echo "║  applications that may also need these kernel parameters.  ║"
-echo "║                                                             ║"
-echo "║  To remove them (if no other apps need them):              ║"
-echo "║    sudo nano /boot/firmware/cmdline.txt                    ║"
-echo "║                                                             ║"
-echo "║  Remove the following from the line, then reboot:          ║"
-echo "║    cgroup_memory=1 cgroup_enable=memory                    ║"
-echo "╚══════════════════════════════════════════════════════════════╝"

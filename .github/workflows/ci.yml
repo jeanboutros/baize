@@ -22,11 +22,12 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install lintian
-        run: sudo apt-get install -y lintian
+        run: sudo apt-get update && sudo apt-get install -y lintian
       - name: Build package
         run: make build
       - name: Run lintian
-        run: lintian baize-kube_*.deb || true
+        # Error-level findings must gate CI (they gate `make lint` too).
+        run: lintian --fail-on error baize-kube_*.deb
 
   test:
     name: Test (bats)
@@ -38,7 +39,9 @@ jobs:
       - name: Install bats
         run: sudo apt-get update && sudo apt-get install -y bats
       - name: Run tests
-        run: bats test/
+        # NOTE: `bats test/` alone finds no tests (no *.bats directly in
+        # test/) — the suites live in test/unit/ and test/integration/.
+        run: bats test/unit/*.bats test/integration/*.bats
 
   docs:
     name: Documentation checks
@@ -46,6 +49,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Check all doc links are valid files
+        # Matches bare relative .md links (doc/ uses "](01-cgroups.md)" style,
+        # not "./"-prefixed) — the previous dot-prefixed regex never matched.
         run: |
           errors=0
           for f in doc/*.md; do
@@ -55,12 +60,14 @@ jobs:
                 echo "Broken link in $f: $link -> $target (not found)"
                 errors=1
               fi
-            done < <(grep -oP '\[.*?\]\(\.\.?/[^)]+\)' "$f" | sed 's/.*(\(.*\))/\1/')
+            done < <(grep -oP '\]\([^)#]+\.md\)' "$f" | sed 's/.*](\(.*\))/\1/')
           done
           exit $errors
 
       - name: Check README doc table is complete
+        # The previous version only echoed the counts without comparing.
         run: |
           doc_count=$(ls doc/*.md | wc -l)
           table_count=$(grep -c 'doc/0' README.md)
           echo "doc/ files: $doc_count, README table entries: $table_count"
+          [ "$doc_count" -eq "$table_count" ] || { echo "::error::README doc table is incomplete"; exit 1; }

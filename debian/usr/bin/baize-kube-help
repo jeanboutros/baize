@@ -1,0 +1,230 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# baize-kube-help — Interactive guide to the baize-kube system
+#
+# Shows how to manage users, verify access, troubleshoot kubectl, use basic
+# kubectl/minikube commands, and explains the system architecture.
+# =============================================================================
+
+cat <<'EOF'
+================================================================================
+                          baize-kube — USER GUIDE
+================================================================================
+
+baize-kube runs a rootless Kubernetes (minikube) cluster on this machine,
+owned by a dedicated locked service user 'baize'. Human access is granted
+through two Unix groups:
+
+  baize-admins     full cluster admin (uses /etc/baize-kube/admin-kubeconfig)
+  baize-consumers  limited per-user access (own ServiceAccount + kubeconfig)
+
+--------------------------------------------------------------------------------
+1. MANAGING USERS
+--------------------------------------------------------------------------------
+
+Grant a user cluster access (creates their kubeconfig + ServiceAccount):
+  sudo baize-kube-add-consumer <username>
+
+Remove a user's access:
+  sudo baize-kube-remove-consumer <username>
+
+Refresh the shared admin kubeconfig (stale-port fix):
+  sudo baize-kube-update-admin-kubeconfig
+
+List provisioned users:
+  sudo baize-kube-list-consumers
+
+Rebuild a user's kubeconfig (e.g. after token rotation):
+  sudo baize-kube-update-kubeconfig <username>
+
+Make a user a full admin:
+  sudo usermod -aG baize-admins <username>
+  (user must log out and back in for the group to take effect)
+
+--------------------------------------------------------------------------------
+2. CHECKING A USER'S ACCESS
+--------------------------------------------------------------------------------
+
+Check which group a user is in (id prints uid/gid and ALL group names):
+  id <username>
+
+As an admin, verify a consumer's permissions inside the cluster
+(auth can-i lists what the kubeconfig is ALLOWED to do — the safest way
+to answer "can user X do Y?"):
+  KUBECONFIG=~<username>/.kube/config kubectl auth can-i --list
+  KUBECONFIG=~<username>/.kube/config kubectl get pods
+
+Admins use the shared admin kubeconfig (set automatically at login via
+/etc/profile.d/baize-kube.sh when a member of baize-admins):
+  kubectl get nodes
+
+Test that everything works end-to-end with a one-shot busybox pod.
+Flag-by-flag: --image picks the container image; --rm DELETES the pod
+when it exits; -it attaches a terminal (interactive + tty); 
+--restart=Never means "run once, never restart" (required with --rm);
+everything after -- is the command the pod runs. The pod is created,
+prints OK, and is automatically deleted:
+  kubectl run baize-test --image=busybox:latest \
+      --rm -it --restart=Never -- echo OK
+
+--------------------------------------------------------------------------------
+3. KUBECTL NOT WORKING? (TROUBLESHOOTING)
+--------------------------------------------------------------------------------
+EOF
+
+cat <<'EOF'
+Symptom: "The connection to the server ... was refused"
+  The cluster is not running. Start it:
+    sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+        systemctl --user start minikube
+  Or check its status:
+    sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+        systemctl --user status minikube
+
+Symptom: "error: no configuration has been provided"
+  Your KUBECONFIG is not set. Admins: log out/in so /etc/profile.d/baize-kube.sh
+  applies, or run:
+    export KUBECONFIG=/etc/baize-kube/admin-kubeconfig
+  Consumers: ensure ~/.kube/config exists (run baize-kube-add-consumer if not).
+
+Symptom: "connection refused 127.0.0.1:<port>" although the cluster is up
+  The admin kubeconfig is a snapshot taken at install time. Its port (a
+  random podman port-forward) changes whenever the minikube container is
+  recreated. Regenerate it:
+    sudo baize-kube-update-admin-kubeconfig
+  (then refresh consumers: sudo baize-kube-update-kubeconfig <username>)
+
+  NOTE: the API endpoint is LOCAL to this machine (127.0.0.1). Remote
+  admins need an SSH tunnel or to run kubectl on the Pi itself.
+
+Symptom: "connection refused" right after a reboot
+  The minikube service may still be starting (it boots a podman machine
+  first). Wait ~1-2 minutes, then retry. If it stays down:
+    sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+        podman machine ls        # machine should be 'Running'
+    sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+        journalctl --user -u minikube
+
+Regenerate the SHARED admin kubeconfig (after cluster recreation):
+  sudo baize-kube-update-admin-kubeconfig
+
+--------------------------------------------------------------------------------
+4. BASIC KUBECTL COMMANDS
+--------------------------------------------------------------------------------
+(-A is shorthand for --all-namespaces; -f follows output like tail -f;
+ -it allocates an interactive terminal; -n <ns> targets one namespace)
+
+  kubectl get nodes                     list cluster nodes
+  kubectl get pods -A                   list all pods, all namespaces
+  kubectl get services -A               list all services
+  kubectl describe pod <name>           detailed pod info (debugging)
+  kubectl logs <pod-name>               print a pod's logs
+  kubectl logs -f <pod-name>            follow a pod's logs live
+  kubectl exec -it <pod> -- sh         open a shell inside a pod
+  kubectl apply -f <file.yaml>          create/update resources from YAML
+  kubectl delete pod <name>            delete a pod
+  kubectl run test --image=busybox:latest --rm -it --restart=Never -- echo hi
+                                        one-shot test pod (auto-deleted)
+  kubectl auth can-i --list            what can MY kubeconfig do?
+
+--------------------------------------------------------------------------------
+5. BASIC MINIKUBE COMMANDS (run as baize, with its environment)
+--------------------------------------------------------------------------------
+
+All minikube operations must run as the baize user, which needs two
+environment variables: XDG_RUNTIME_DIR (where systemd per-user sockets
+live) and CONTAINER_HOST (where the podman machine API socket is).
+Rather than typing them every time, define a helper function:
+
+  bk() { sudo -u baize env \
+      XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+      CONTAINER_HOST=unix:///run/user/$(id -u baize)/podman/minikube-api.sock \
+      "$@"; }
+
+(Paste it into your ~/.bashrc to keep it. "$@" forwards every argument
+you give bk to the command it runs.)
+
+Then:
+  bk minikube status                    cluster status
+  bk minikube dashboard                 open the web dashboard
+  bk minikube logs                      dump cluster logs for debugging
+  bk minikube ssh                       shell into the cluster node
+  bk minikube pause / unpause           pause/resume (keeps resources)
+  bk minikube update-context             fix kubeconfig after IP changes
+  bk podman machine ls                  VM state (should be 'Running')
+
+--------------------------------------------------------------------------------
+6. HOW THE SYSTEM IS SET UP
+--------------------------------------------------------------------------------
+
+  baize user      Locked service account (no interactive login). Owns the
+                  cluster, the podman machine, and all cluster state under
+                  /home/baize/.minikube. Member of kvm group for QEMU
+                  hardware acceleration; has subuid/subgid ranges for
+                  rootless container user-namespace mapping.
+
+  Podman machine  A QEMU virtual machine 'minikube' (default 4 CPU / 6144 MB
+                  memory / 30 GB disk) owned by baize. minikube's podman
+                  driver creates the Kubernetes node as containers INSIDE
+                  this machine. The machine's size can be set BEFORE
+                  installation with environment variables:
+                    sudo env BAIZE_KUBE_MACHINE_CPUS=2 \
+                             BAIZE_KUBE_MACHINE_MEMORY=4096 dpkg -i ...
+                  (minimums: 2 CPU, 4096 MB — the node plus ~1 GB guest OS). The podman client reaches
+                  the machine via the API socket:
+                    unix:///run/user/<baize-uid>/podman/minikube-api.sock
+                  (exported as CONTAINER_HOST everywhere it matters).
+
+  Boot chain       systemd user@<uid>.service (lingering enabled)
+                    -> minikube.service (oneshot, RemainAfterExit)
+                       -> ExecStartPre: podman machine start minikube
+                       -> ExecStart: minikube start --driver=podman \
+                          --container-runtime=containerd
+
+  Access model    Admins:    shared admin kubeconfig (full RBAC power)
+                  Consumers: per-user ServiceAccount (consumer-<username>)
+                             + token Secret + kubeconfig at
+                             ~<username>/.kube/config
+
+--------------------------------------------------------------------------------
+7. INTERNALS (DEEPER DETAILS)
+--------------------------------------------------------------------------------
+
+  Cgroups          The kernel boots with cgroup_memory=1 cgroup_enable=memory
+                   (patched into /boot/firmware/cmdline.txt by the installer).
+                   systemd delegates cpu/cpuset/io/memory/pids controllers to
+                   the baize user session via
+                   /etc/systemd/system/user@.service.d/delegate.conf — required
+                   for rootless containers to set resource limits.
+
+  Podman helpers   The podman machine stack needs two helper binaries that
+                   Debian ships outside podman's search path. The installer
+                   links them into /usr/libexec/podman/:
+                     gvproxy    (user-mode networking for the VM)   <- /usr/bin/gvproxy
+                     virtiofsd  (host<->VM filesystem sharing)      <- /usr/libexec/virtiofsd
+                   Without the virtiofsd link, machine start fails.
+
+  QEMU/KVM         The Raspberry Pi 5 exposes /dev/kvm. baize is in the kvm
+                   group so the machine uses hardware virtualisation. Without
+                   it QEMU falls back to software emulation (TCG) — orders of
+                   magnitude slower.
+
+  Rootless model   Nothing runs as root. minikube -> podman (rootless, as
+                   baize) -> podman machine VM (QEMU as baize) -> containerd
+                   inside the machine -> Kubernetes node containers.
+
+  Cluster state    /home/baize/.minikube/           minikube profiles
+                   /home/baize/.config/containers/  podman machine config
+                   /home/baize/.local/share/containers/  machine disk image
+                   /etc/baize-kube/                  admin kubeconfig, consumers.conf
+
+  Removal          On apt remove/purge: minikube cluster deleted, podman
+                   machine stopped and removed, baize user and its state
+                   deleted. cmdline.txt is left patched (harmless; may be
+                   needed by other software).
+
+Full documentation: /usr/share/doc/baize-kube/
+================================================================================
+EOF

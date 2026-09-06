@@ -70,7 +70,7 @@ Rootless Docker exists but is more complex to configure than Podman on Debian-de
 - Set a password for `baize` for administrative access
 - Allow SSH login for `baize`
 
-**Reasoning:** The `baize` account is infrastructure, not a person. No human should log in as `baize` interactively. Administrative access to the cluster is done by a consumer via `sudo -u baize`, which requires the consumer to authenticate with their own password. This preserves a full audit trail: the sudo log records who did what, as whom, and when.
+**Reasoning:** The `baize` account is infrastructure, not a person. No human should log in as `baize` interactively. Administrative access to the cluster is done by an administrator via `sudo -u baize`, which requires the administrator to authenticate with their own password. This preserves a full audit trail: the sudo log records who did what, as whom, and when.
 
 An account that nobody should log into should be incapable of logging in.
 
@@ -163,21 +163,55 @@ World-readable would expose the kubeconfig (which includes cluster credentials) 
 
 ---
 
-## Why `--no-vtx-check` on minikube start?
+## Why `--no-vtx-check` was REMOVED from minikube start
 
-**Decision:** The minikube systemd service and the `start_cluster()` function both pass `--no-vtx-check` to `minikube start`.
+**Decision:** The flag is no longer passed to `minikube start`.
+
+**Reasoning (corrected twice — a cautionary tale about verifying against
+upstream source):** minikube v1.39.0's `start_flags.go` marks `--no-vtx-check`
+as **"(virtualbox driver only)"** — the check it disables never runs for any
+other driver, so the flag was a no-op in this stack the whole time. This
+document previously claimed the Pi 5 "does not have KVM", which is also
+wrong: `/dev/kvm` is present on Raspberry Pi OS and the podman machine uses
+it for QEMU hardware acceleration (hence `baize` is added to the `kvm`
+group; without KVM, QEMU falls back to TCG emulation — orders of magnitude
+slower). Since the flag does nothing for the podman driver, removing it
+removes cargo cult; nothing about the cluster changes.
+
+**Verification:** upstream source, cmd/minikube/cmd/start_flags.go at tag
+v1.39.0: "Disable checking for the availability of hardware virtualization
+before the vm is started (virtualbox driver only)".
+
+---
+
+## Why a dedicated podman machine for minikube?
+
+**Decision:** The installer creates a named podman machine (`minikube`, QEMU provider, 4 CPU / 6144 MB / 30 GB) owned by the `baize` user, and points every podman/minikube invocation at its API socket via `CONTAINER_HOST=unix:///run/user/<baize-uid>/podman/minikube-api.sock`.
 
 **Alternatives considered:**
-- Omit the flag and let minikube perform its default hardware virtualisation check
-- Use a different driver that does not require virtualisation
+- Rely on host rootless podman directly (no machine)
+- Expect the admin to create and wire the machine manually
 
-**Reasoning:** The `--no-vtx-check` flag disables minikube's check for hardware virtualisation support (KVM on Linux, Hyper-V on Windows). On x86_64 systems, minikube can use KVM to run a lightweight VM for the Kubernetes node, and the virtualisation check ensures KVM is available before attempting to start.
+**Reasoning:** On Debian, the podman machine stack does not work out of the box. Two helper binaries live outside podman's search path and must be linked into `/usr/libexec/podman/`:
 
-The Raspberry Pi 5 is an arm64 (AArch64) platform. It does not have KVM or any hardware virtualisation extensions available. On arm64, minikube uses software emulation (QEMU under the hood) rather than hardware-accelerated virtualisation. The virtualisation check would always fail on this platform, blocking the cluster from starting.
+| Helper | Debian path | Podman expects | Effect of absence |
+|---|---|---|---|
+| `virtiofsd` (package `virtiofsd`) | `/usr/libexec/virtiofsd` | `/usr/libexec/podman/virtiofsd` | `podman machine start` **fails** (not in `$PATH`, not in a helper dir) |
+| `gvproxy` (package `gvproxy`) | `/usr/bin/gvproxy` | `/usr/libexec/podman/gvproxy` | found via `$PATH` only because Debian patches podman (Debian bug tracker, patch `0008-Allow-searching-the-system-PATH-for-gvproxy`); the symlink is belt-and-braces |
 
-The flag is a **no-op on arm64** — it simply skips a check that is irrelevant to the platform. It does not disable any actual virtualisation feature, because none exists to disable. The cluster runs correctly with software emulation, and the flag is safe to use permanently on this hardware.
+Without these links the machine cannot start, minikube's podman driver then talks to a broken host podman service, and the install fails deep inside `minikube start` — exactly the failure that motivated this design. The postinst therefore: installs the helper packages (`Depends:`), creates the symlinks, adds `baize` to the `kvm` group (QEMU hardware acceleration via `/dev/kvm`), creates the machine idempotently (`--update-connection` also makes it the user's default podman connection), and verifies the socket before starting minikube. The machine is stopped in `prerm` and removed in `postrm` (both remove and purge — the machine's disk image lives under the `baize` home, so it dies with the user anyway; explicit removal keeps `podman system connection` clean for reinstalled systems).
 
-This is documented here so that future maintainers do not remove the flag thinking it is unnecessary or a workaround for a transient issue. It is a permanent, platform-appropriate configuration.
+**Why the machine is stopped by `ExecStopPost` but NOT by `ExecStop`:** the unit's `ExecStop` is a bare `minikube stop` — the fast path: the cluster goes down, the machine keeps running, and the next `minikube start` skips the ~30 s VM boot entirely. `ExecStopPost=-podman machine stop minikube` is a *different* concern: whenever the UNIT stops — including `systemctl --user stop/restart` and host shutdown — systemd would otherwise SIGTERM the whole unit cgroup, and the QEMU process lives in it (podman's machine starter forks and releases QEMU into the service's cgroup). A SIGKILLed QEMU is an unclean VM poweroff, which risks guest-filesystem corruption over time. `ExecStopPost` performs a clean QMP/ACPI powerdown *before* systemd sweeps the cgroup; the machine is started again by `ExecStartPre` on the next unit start. Package removal (prerm/postrm) is a separate, explicit stop+remove path.
+
+**Why machine sizing is overridable via environment variables:** the defaults (4 CPU / 6144 MiB / 30 GiB) suit a Pi with 8 GB of RAM (a full 8 GiB machine would overcommit the host). Installers on smaller boards need a way to shrink the machine without hand-editing the postinst. Two variables, read once at install time and validated (`BAIZE_KUBE_MACHINE_CPUS`, `BAIZE_KUBE_MACHINE_MEMORY`; enforced minimums 2 CPU and 4096 MiB — minikube's 3072 MiB suggested node allocation (verified in v1.39.0 source, suggestMemoryAllocation) plus ~1 GiB of guest-OS overhead), keep this a supported configuration surface rather than a fork of the script. A GitHub-runner install test was considered and rejected: hosted runners have no nested virtualization (`/dev/kvm`), so the QEMU machine would fall back to TCG software emulation — the cluster test would be slow and flaky, exactly the failure mode this package exists to prevent on real hardware.
+
+---
+
+## Why pin kubectl to the same minor version as the cluster?
+
+**Decision:** kubectl is pinned to v1.37.0, matching the Kubernetes version that minikube v1.39.0 deploys by default.
+
+**Reasoning:** The Kubernetes version-skew policy states kubectl may be at most one minor version older or newer than the API server. Since this package fully controls both versions, we pin them equal — zero skew. (The previous pin, v1.35.1 against a v1.37 cluster, silently violated the policy.) Both versions are verified against upstream release notes at bump time; each pinned SHA256 in the postinst is anchored to its authoritative source — minikube's to the GitHub release, kubectl's to dl.k8s.io — and verified at bump time.
 
 ---
 

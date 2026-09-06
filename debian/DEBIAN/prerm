@@ -1,41 +1,99 @@
 #!/bin/bash
+# =============================================================================
+# baize-kube prerm — runs BEFORE package files are removed.
+#
+# This is the right place to clean up the RUNNING cluster: minikube's
+# state lives outside the package (in /home/baize), and the minikube
+# binary is still present at prerm time (dpkg deletes it afterwards).
+#
+# SCRIPT SAFETY HEADER (project convention, see postinst for the full
+# explanation of -e / -u / -o pipefail):
+#   set -e  exit on any command failure
+#   set -u  unset variables are fatal errors
+#   set -o pipefail  pipelines report the first failure, not the last
+# =============================================================================
 set -euo pipefail
-
-# baize-kube prerm
-# Runs BEFORE package files are removed.
-# Cleans up the minikube cluster while the binary still exists.
-
-ACTION="${1:-}"
-
-# Only run cluster cleanup on remove/purge, not upgrade
-if [ "$ACTION" != "remove" ] && [ "$ACTION" != "purge" ]; then
-    exit 0
-fi
 
 BAIZE_USER="baize"
 BAIZE_HOME="/home/${BAIZE_USER}"
 MINIKUBE_BIN="/usr/local/bin/minikube"
+PODMAN_BIN="/usr/bin/podman"
+PODMAN_MACHINE_NAME="minikube"
 
 info()  { echo "[baize-kube] INFO:  $*"; }
 warn()  { echo "[baize-kube] WARN:  $*"; }
 
-# Only attempt cleanup if the baize user and minikube binary exist
-if ! id "$BAIZE_USER" > /dev/null 2>&1; then
-    exit 0
+# -----------------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------------
+main() {
+    # dpkg passes the action as $1. We only clean up on remove/purge —
+    # on UPGRADE ("upgrade"/"failed-upgrade") the old cluster state must
+    # survive so the new package version can adopt it.
+    local action="${1:-}"
+    if [ "$action" != "remove" ] && [ "$action" != "purge" ]; then
+        exit 0
+    fi
+
+    # Only attempt cleanup if the baize user exists — `id user` fails on a
+    # non-existent user, and with it the whole script (set -e). Guarding
+    # with if makes removal work on a half-installed system too.
+    if ! id "$BAIZE_USER" > /dev/null 2>&1; then
+        exit 0
+    fi
+
+    if [ -x "$MINIKUBE_BIN" ]; then
+        info "Disabling minikube service and stopping the cluster..."
+
+        # Disable FIRST: if removal is interrupted after the cluster is
+        # deleted but before postrm runs, an ENABLED unit would recreate a
+        # cluster for a removed package on the next boot. The bus call can
+        # silently fail when no user manager is running (it only unlinks
+        # the enable symlink via the bus — an absent bus leaves the
+        # symlink in place), so ALSO remove the symlink directly as root.
+        # rm -f cannot fail and needs no bus, making the disable certain.
+        runuser -l "$BAIZE_USER" -s /bin/bash -c "
+            export HOME=${BAIZE_HOME}
+            export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+            systemctl --user disable minikube.service 2>/dev/null || true
+        " 2>/dev/null || true
+        rm -f "${BAIZE_HOME}/.config/systemd/user/default.target.wants/minikube.service" 2>/dev/null || true
+
+        # runuser -l baize -c "..." runs the cleanup AS the cluster owner;
+        # the cluster state belongs to baize, so deleting it as root would
+        # leave wrong-permission debris. \$(id -u) is escaped so it
+        # evaluates INSIDE the baize shell (deferred expansion).
+        # `2>/dev/null || true` on each command: removal must succeed even
+        # if the cluster is already half-gone — never block apt on cleanup.
+        runuser -l "$BAIZE_USER" -s /bin/bash -c "
+            export HOME=${BAIZE_HOME}
+            export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+            export MINIKUBE_ROOTLESS=true
+            export CONTAINER_HOST=unix:///run/user/\$(id -u)/podman/${PODMAN_MACHINE_NAME}-api.sock
+            ${MINIKUBE_BIN} stop 2>/dev/null || true
+            ${MINIKUBE_BIN} delete --all 2>/dev/null || true
+        " 2>/dev/null || warn "Could not cleanly stop minikube (may already be stopped)."
+    fi
+
+    # Stop the podman machine. `|| true` makes this tolerant: the machine
+    # may not exist (fresh install that failed early), and a stop failure
+    # must not abort the package removal.
+    if [ -x "$PODMAN_BIN" ]; then
+        info "Stopping podman machine '${PODMAN_MACHINE_NAME}'..."
+        runuser -l "$BAIZE_USER" -s /bin/bash -c "
+            export HOME=${BAIZE_HOME}
+            export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+            ${PODMAN_BIN} machine stop ${PODMAN_MACHINE_NAME} 2>/dev/null || true
+        " 2>/dev/null || warn "Could not stop podman machine (may not exist)."
+    fi
+
+    info "Cluster cleanup complete."
+}
+
+# EXECUTION GUARD: run main() only when executed by dpkg, not when sourced
+# by the unit tests. $0 (executed script path) equals BASH_SOURCE[0] (file
+# currently being read) only in direct execution. To learn more, look up
+# "BASH_SOURCE" in `man bash`.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
 fi
-
-if [ ! -x "$MINIKUBE_BIN" ]; then
-    exit 0
-fi
-
-info "Stopping and deleting minikube cluster before package removal..."
-
-runuser -l "$BAIZE_USER" -s /bin/bash -c "
-    export HOME=${BAIZE_HOME}
-    export XDG_RUNTIME_DIR=/run/user/\$(id -u)
-    export MINIKUBE_ROOTLESS=true
-    ${MINIKUBE_BIN} stop 2>/dev/null || true
-    ${MINIKUBE_BIN} delete --all 2>/dev/null || true
-" 2>/dev/null || warn "Could not cleanly stop minikube (may already be stopped)."
-
-info "Cluster cleanup complete."

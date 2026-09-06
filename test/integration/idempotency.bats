@@ -10,28 +10,34 @@ teardown() {
     teardown_mocks
 }
 
-@test "idempotency: consumer_selection handles empty config file" {
-    # Create empty config
+# consumer_selection() must FAIL (fail-fast, never "all users") when its
+# config exists but contains no valid usernames. These tests CALL the
+# function (earlier versions only sourced the script and asserted nothing,
+# with the wrong variable name — they were vacuous).
+@test "idempotency: consumer_selection fails on empty config file" {
     mkdir -p /tmp/baize-kube-test
     echo "" > /tmp/baize-kube-test/consumers.conf
 
-    # Should not fail on empty config
-    run bash -c '
-        CONSUMERS_CONFIG="/tmp/baize-kube-test/consumers.conf"
-        source debian/DEBIAN/postinst 2>/dev/null || true
-    '
+    source_postinst_lib debian/DEBIAN/postinst
+    CONSUMERS_CONF="/tmp/baize-kube-test/consumers.conf" \
+        run consumer_selection
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"No consumers specified"* ]]
+
     rm -rf /tmp/baize-kube-test
 }
 
-@test "idempotency: consumer_selection handles commented config" {
+@test "idempotency: consumer_selection fails on comment-only config" {
     mkdir -p /tmp/baize-kube-test
     echo "# only comments" > /tmp/baize-kube-test/consumers.conf
     echo "# no actual users" >> /tmp/baize-kube-test/consumers.conf
 
-    run bash -c '
-        CONSUMERS_CONFIG="/tmp/baize-kube-test/consumers.conf"
-        source debian/DEBIAN/postinst 2>/dev/null || true
-    '
+    source_postinst_lib debian/DEBIAN/postinst
+    CONSUMERS_CONF="/tmp/baize-kube-test/consumers.conf" \
+        run consumer_selection
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"No consumers specified"* ]]
+
     rm -rf /tmp/baize-kube-test
 }
 

@@ -17,17 +17,25 @@ sudo apt update
 sudo apt install -y podman curl systemd
 ```
 
+The package pulls in its remaining runtime dependencies via `Depends:`
+(gvproxy, virtiofsd, qemu-system-arm, uidmap, crun, bash-completion).
+`podman` itself must come from the same apt transaction, hence the
+explicit line above.
+
+**Disk space:** the podman machine image (~600 MB download) plus the
+minikube node image and cluster state need roughly 10 GB free.
+
 ### Consumer users
 
-Consumer users (human users who will access the cluster) must have `sudo` access. The `sudo -u baize` pattern used for cluster administration requires the consumer to authenticate with their own password via sudo.
+Consumer users (human users who will access the cluster) need **no sudo and
+no special privileges**. Their access is a per-user kubeconfig provisioned
+by an admin with `sudo baize-kube-add-consumer <username>` — they simply
+run `kubectl` as themselves.
 
-To grant a user sudo access:
-
-```bash
-sudo usermod -aG sudo <username>
-```
-
-The user must log out and back in for the group change to take effect.
+Only **administrators** need sudo (for the management scripts and
+`sudo -u baize` cluster operations, which are auditable). Do NOT add
+consumers to the `sudo` group — that would dissolve the two-group
+security model entirely (see doc/05).
 
 ---
 
@@ -57,7 +65,18 @@ If this file is not present and the install is running non-interactively (e.g. v
 ### Step 1 — Install the package
 
 ```bash
-sudo dpkg -i baize-kube_1.0_arm64.deb
+sudo dpkg -i baize-kube_<version>_arm64.deb
+```
+
+**Optional — size the podman machine before install.** The installer
+creates a QEMU podman machine for the `baize` user (default 4 CPUs,
+6144 MiB memory, 30 GiB disk). On memory-constrained boards, override
+with environment variables (minimums are minikube's requirements:
+2 CPUs, 4096 MiB (node + guest OS) — invalid values fail the install immediately):
+
+```bash
+sudo env BAIZE_KUBE_MACHINE_CPUS=2 BAIZE_KUBE_MACHINE_MEMORY=4096 \
+    dpkg -i baize-kube_<version>_arm64.deb
 ```
 
 The installer will:
@@ -69,7 +88,7 @@ The installer will:
 5. Add the users from `consumers.conf` to the `baize-consumers` group
 6. Add the first valid user to the `baize-admins` group (initial cluster admin)
 7. Download `minikube` and `kubectl` binaries
-8. Install management scripts to `/usr/local/bin/`
+8. Install management scripts to `/usr/bin/`
 9. Enable systemd lingering for `baize`
 10. Configure minikube for rootless Podman
 11. Install and enable the minikube systemd user service
@@ -138,10 +157,14 @@ cat /sys/fs/cgroup/cgroup.controllers
 # Expected: cpuset cpu io memory pids
 ```
 
-### Check the baize user service
+### Check the baize user service and podman machine
 
 ```bash
-sudo -u baize systemctl --user status minikube
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+    systemctl --user status minikube
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+    podman machine ls
+# The machine "minikube" must be in state "Running"
 ```
 
 ### Check the cluster
@@ -280,25 +303,28 @@ sudo reboot
 
 ### `kubectl` returns "connection refused"
 
-The cluster may still be starting. Check the service:
+The cluster may still be starting — the podman machine boots first
+(~30 s), then minikube pulls and starts the node image (several minutes
+on first boot). Check the service:
 
 ```bash
-sudo -u baize journalctl --user -u minikube --since "5 minutes ago"
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+    journalctl --user -u minikube --since "5 minutes ago"
 ```
 
-Allow up to 5 minutes on first boot.
+Allow up to 10 minutes on first boot.
 
 ### `sudo -u baize minikube` fails with XDG_RUNTIME_DIR error
 
-The baize user's runtime directory may not be mounted. Trigger it:
+`sudo -u baize` (unlike `runuser -l`) does NOT create a login session,
+so `XDG_RUNTIME_DIR` is never set — always prefix commands with
+`env XDG_RUNTIME_DIR=/run/user/$(id -u baize)` (and, for podman/minikube,
+`CONTAINER_HOST=unix:///run/user/$(id -u baize)/podman/minikube-api.sock`),
+or use the `bk` wrapper function documented in
+[06-operations.md](06-operations.md).
 
-```bash
-sudo machinectl shell baize@
-# This starts a proper login session for baize
-exit
-```
-
-Or check if lingering is enabled:
+If the runtime directory itself is missing even with the env var set,
+check that lingering is enabled:
 
 ```bash
 loginctl show-user baize | grep Linger
@@ -311,28 +337,37 @@ If not:
 sudo loginctl enable-linger baize
 ```
 
+### Podman machine will not start / "missing virtiofsd" errors
+
+The installer links the helper binaries (`gvproxy`, `virtiofsd`) into
+`/usr/libexec/podman/` and adds `baize` to the `kvm` group (see
+[03-rootless-containers.md](03-rootless-containers.md) for why). If the
+links were removed, reinstall the package — the postinst re-creates
+everything idempotently:
+
+```bash
+sudo apt install --reinstall baize-kube
+```
+
 ### Volume already exists error on minikube start
 
 A previous failed start left a dangling volume:
 
 ```bash
-sudo -u baize podman volume rm minikube
-sudo -u baize systemctl --user start minikube
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+    CONTAINER_HOST=unix:///run/user/$(id -u baize)/podman/minikube-api.sock \
+    podman volume rm minikube
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+    systemctl --user start minikube
 ```
 
 ### Kubeconfig is stale after cluster reconfiguration
 
-Regenerate the admin kubeconfig:
+Regenerate the admin kubeconfig with the packaged helper (it handles the
+umask, permissions, and environment variables correctly):
 
 ```bash
-sudo -u baize bash -c '
-  export HOME=/home/baize
-  export XDG_RUNTIME_DIR=/run/user/$(id -u)
-  export MINIKUBE_ROOTLESS=true
-  minikube kubectl -- config view --flatten > /etc/baize-kube/admin-kubeconfig
-'
-sudo chown root:baize-admins /etc/baize-kube/admin-kubeconfig
-sudo chmod 640 /etc/baize-kube/admin-kubeconfig
+sudo baize-kube-update-admin-kubeconfig
 ```
 
 For consumer kubeconfigs, use:
@@ -355,12 +390,16 @@ This will:
 - Disable systemd lingering for baize
 - Remove the `baize` user and home directory
 - Remove the `baize-admins` and `baize-consumers` groups
-- Remove `/etc/baize-kube/`
-- Remove management scripts from `/usr/local/bin/`
+- Preserve `/etc/baize-kube/consumers.conf` (purge deletes it)
+- Remove management scripts from `/usr/bin/`
 - Remove `/usr/local/bin/minikube` and `/usr/local/bin/kubectl`
 - Remove the cgroup delegation config
 - Remove the shell profile snippet
 - Remove the post-reboot trigger service and flag file
+
+**Reinstall note:** `consumers.conf` is preserved and re-adopted
+automatically, but consumer kubeconfigs are NOT — after remove+reinstall,
+re-run `sudo baize-kube-add-consumer <username>` for each user.
 
 **What is NOT removed:** The `cgroup_memory=1 cgroup_enable=memory` parameters in `/boot/firmware/cmdline.txt`. These are harmless on their own but can be removed manually if desired:
 

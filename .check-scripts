@@ -5,7 +5,9 @@ debian/DEBIAN/postrm
 debian/DEBIAN/prerm
 debian/DEBIAN/config
 debian/usr/lib/baize-kube/complete-install
-debian/usr/local/bin/baize-kube-add-consumer
-debian/usr/local/bin/baize-kube-remove-consumer
-debian/usr/local/bin/baize-kube-list-consumers
-debian/usr/local/bin/baize-kube-update-kubeconfig
+debian/usr/bin/baize-kube-add-consumer
+debian/usr/bin/baize-kube-remove-consumer
+debian/usr/bin/baize-kube-list-consumers
+debian/usr/bin/baize-kube-update-kubeconfig
+debian/usr/bin/baize-kube-help
+debian/usr/bin/baize-kube-update-admin-kubeconfig

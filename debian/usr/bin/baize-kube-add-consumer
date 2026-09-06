@@ -132,17 +132,17 @@ parse_args() {
 validate() {
     # Check admin kubeconfig — attempt recovery if missing
     if [ ! -r "$ADMIN_KUBECONFIG" ]; then
-        # Check if minikube is running and try to regenerate
-        if command -v minikube > /dev/null 2>&1 && \
-           sudo -u baize minikube status 2>/dev/null | grep -q "Running"; then
-            info "Admin kubeconfig missing but cluster is running. Regenerating..."
-            sudo -u baize minikube kubectl -- config view --flatten 2>/dev/null | \
-                sudo tee "$ADMIN_KUBECONFIG" > /dev/null 2>&1 || true
-            if [ -f "$ADMIN_KUBECONFIG" ] && [ -s "$ADMIN_KUBECONFIG" ]; then
-                sudo chown "root:baize-admins" "$ADMIN_KUBECONFIG"
-                sudo chmod 640 "$ADMIN_KUBECONFIG"
-                success "Admin kubeconfig regenerated."
-            fi
+        # SECURITY: delegate regeneration to the hardened helper instead of
+        # piping through `sudo tee` (which truncates the destination first
+        # and inherits the ambient umask — a 0644 world-readable window
+        # for cluster-admin credentials). The helper writes under umask 077
+        # directly into the 0750 admin directory and refuses empty output.
+        # We are already root (the internal `sudo` calls were redundant).
+        # Absolute path: a polluted PATH (e.g. sudo -E) must never resolve
+        # this privileged helper to an attacker-planted lookalike.
+        if [ -x /usr/bin/baize-kube-update-admin-kubeconfig ]; then
+            info "Admin kubeconfig missing — attempting regeneration..."
+            /usr/bin/baize-kube-update-admin-kubeconfig 2>/dev/null || true
         fi
 
         # If still missing after recovery attempt, fail with helpful message
@@ -168,7 +168,7 @@ validate() {
 
     # Check cluster is running
     if ! KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get nodes --request-timeout=5s > /dev/null 2>&1; then
-        fail "Cannot reach the Kubernetes cluster. Is minikube running? Check: sudo -u baize systemctl --user status minikube"
+        fail "Cannot reach the Kubernetes cluster. Is minikube running? Check: sudo -u baize env XDG_RUNTIME_DIR=/run/user/\$(id -u baize) systemctl --user status minikube"
     fi
 
     # Validate role
@@ -325,11 +325,45 @@ build_kubeconfig() {
     token=$(KUBECONFIG="$ADMIN_KUBECONFIG" "$KUBECTL" get secret "$secret_name" -n default \
         -o jsonpath='{.data.token}' | base64 -d)
 
-    # Create .kube directory
-    mkdir -p "$kube_dir"
+    # SECURITY: we run as root writing into the TARGET USER's home, which
+    # the target user controls. A pre-planted symlink at ~/.kube/config
+    # (or a symlinked ~/.kube) would redirect root's write to an arbitrary
+    # file. The refusal check runs BEFORE any mkdir/mktemp so a refusal
+    # leaves NO root-owned debris (dir or temp file) in the consumer's
+    # home. Then: write to a fresh mktemp file (O_EXCL + kernel entropy —
+    # unguessable and un-enumerable), and atomically rename it over the
+    # destination; rename(2) (mv -T) REPLACES symlinks rather than
+    # following them. umask 077 keeps the bearer token from ever being
+    # briefly world-readable.
+    if [ -L "$kubeconfig_path" ] || [ -L "$kube_dir" ]; then
+        fail "Refusing to write: '${kubeconfig_path}' or '${kube_dir}' is a symlink."
+    fi
 
-    # Write kubeconfig
-    cat > "$kubeconfig_path" <<YAMLEOF
+    # Create .kube directory (after the checks — nothing is created on
+    # refusal) and fix its ownership/mode IMMEDIATELY, before any further
+    # step. Doing this here (not after the rename below) preserves the
+    # invariant that NO post-rename operation touches a consumer-swappable
+    # path: ~/.kube lives in the consumer's home and can be swapped for a
+    # symlink at any instant, and chown/chmod FOLLOW symlinks — a post-
+    # rename swap would hand the consumer ownership of an arbitrary root
+    # directory (e.g. /etc/baize-kube). -m 700 also avoids a brief
+    # world-readable window (mkdir inherits the ambient umask otherwise).
+    # shellcheck disable=SC2174  # -m applies to .kube (the deepest dir) —
+    # exactly what we want: the parent (~) already exists with the user's
+    # own mode and must not be touched.
+    mkdir -p -m 700 "$kube_dir"
+    # chown -h: change the DIRECTORY's own inode (a symlink swapped in at
+    # the last instant is touched as a link, never followed).
+    chown -h "${USERNAME}:" "$kube_dir"
+    chmod 700 "$kube_dir"
+
+    # mktemp uses O_EXCL + kernel randomness, so a consumer cannot pre-plant
+    # or re-create a symlink at the temp name. mktemp creates the file 0600
+    # regardless of umask; the umask-077 subshell below is defense-in-depth
+    # for the redirect.
+    local tmp_config
+    tmp_config=$(mktemp "${kube_dir}/.config.baize-new.XXXXXX")
+    ( umask 077; cat > "$tmp_config" <<YAMLEOF
 apiVersion: v1
 kind: Config
 current-context: baize-consumer
@@ -348,12 +382,23 @@ users:
   user:
     token: ${token}
 YAMLEOF
+    )
 
-    # Set ownership and permissions
-    chown "${USERNAME}:${USERNAME}" "$kubeconfig_path"
-    chmod 600 "$kubeconfig_path"
-    chown "${USERNAME}:${USERNAME}" "$kube_dir"
-    chmod 700 "$kube_dir"
+    # SECURITY: chown/chmod happen on the TEMP file BEFORE the rename. If
+    # they ran after the mv, a racing consumer could swap the destination
+    # for a symlink between the mv and the chown — and chown/chmod FOLLOW
+    # symlinks, handing the attacker a chown-arbitrary-file primitive.
+    # Doing ownership work on the temp file (unguessable name, consumer
+    # cannot re-create it), then renaming, means no post-rename operation
+    # ever touches the consumer-swappable destination path. rename(2)
+    # preserves ownership. ":" after the username = the user's LOGIN
+    # group, robust even when it is not named after the user.
+    chown "${USERNAME}:" "$tmp_config"
+    chmod 600 "$tmp_config"
+    # The rename is the LAST operation: the directory ownership was fixed
+    # before mktemp (see above), so nothing consumer-swappable is touched
+    # after this line.
+    mv -T "$tmp_config" "$kubeconfig_path"
 
     success "Kubeconfig written to ${kubeconfig_path} (mode 600, owned by ${USERNAME})."
 }

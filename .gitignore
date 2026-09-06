@@ -2,3 +2,6 @@
 .vscode
 docs
 CHANGELOG.txt
+# Build artifacts (make build / make clean)
+debian/usr/share/doc/
+*.deb

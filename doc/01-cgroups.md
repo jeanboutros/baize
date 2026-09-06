@@ -64,6 +64,26 @@ cat /sys/fs/cgroup/cgroup.controllers
 # should include: memory
 ```
 
+## Where the memory limit is actually enforced (podman machine note)
+
+Since this package moved to the podman-machine model, there are two kernels
+in play: the **host** (the Pi) and the **guest** (the Fedora CoreOS VM that
+runs the Kubernetes node). The node container's `--memory` limits are
+**enforced by the guest kernel**, which always ships with the memory
+controller active. Minikube does have a memory-controller *check*, but it
+runs in the minikube binary **on the host** (reading the host's cgroup
+mount table) — and only as a non-fatal warning when `--memory` is passed
+explicitly, which this package's start command never does.
+
+The host-side machinery in this package (cmdline.txt patch, cgroup
+delegation drop-in, reboot-completion service) therefore guards the
+**host-side rootless stack** — the QEMU, gvproxy and virtiofsd processes
+that run in baize's user slice and depend on the delegated memory
+controller there. Verifying that a patchless host kernel boots and runs
+this machine-based flow would allow the reboot flow to be simplified in a
+future release; until then, the machinery is kept — it is tested,
+idempotent, and has a clean uninstall story.
+
 ## Further reading
 
 - [kernel.org cgroup v2 documentation](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)

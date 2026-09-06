@@ -34,10 +34,11 @@ jobs:
         run: make build VERSION=${{ env.VERSION }}
 
       - name: Install lintian
-        run: sudo apt-get install -y lintian
+        run: sudo apt-get update && sudo apt-get install -y lintian
 
       - name: Run lintian
-        run: lintian baize-kube_${{ env.VERSION }}_arm64.deb || true
+        # Error-level findings must gate the release (they gate `make lint`).
+        run: lintian --fail-on error baize-kube_${{ env.VERSION }}_arm64.deb
 
       - name: Verify .deb exists
         run: |

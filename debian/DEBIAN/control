@@ -1,10 +1,10 @@
 Package: baize-kube
-Version: 1.0
+Version: 1.0.0
 Architecture: arm64
 Section: admin
 Priority: optional
 Maintainer: Jean Boutros <jean.boutros@example.com>
-Depends: podman, curl, systemd, debconf
+Depends: podman, gvproxy, virtiofsd, qemu-system-arm, uidmap, crun, curl, systemd, debconf, bash-completion
 Standards-Version: 4.7.0
 Homepage: https://github.com/jeanboutros/baize-kube
 Description: Rootless minikube cluster service for Raspberry Pi

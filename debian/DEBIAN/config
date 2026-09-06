@@ -6,8 +6,19 @@ set -euo pipefail
 
 . /usr/share/debconf/confmodule
 
-# Only ask if no config file exists
+# Only ask if no config file exists (-s = exists and is non-empty)
 if [ ! -s /etc/baize-kube/consumers.conf ]; then
+    # db_input queues a debconf question for the user; db_go displays all
+    # queued questions. Both take NO extra arguments — the debconf protocol
+    # is positional over stdin/stdout, and forwarding this script's own
+    # command-line (e.g. "configure 1.2.0" from dpkg) would corrupt the
+    # INPUT/GO protocol commands (debconf would reject them with code 20
+    # and the question would never be asked). `|| true` keeps a debconf
+    # hiccup from aborting the script. shellcheck disable=SC2119: passing
+    # "$@" here is precisely the bug; the debconf db_* helpers are not
+    # shell functions with positional semantics.
+    # shellcheck disable=SC2119
     db_input high baize-kube/consumers || true
+    # shellcheck disable=SC2119
     db_go || true
 fi

@@ -19,17 +19,32 @@ sudo apt update
 sudo apt install -y podman curl systemd
 ```
 
-Consumer users (human users who will access the cluster) must have `sudo` access. The `sudo -u baize` pattern used for cluster administration requires the consumer to authenticate with their own password via sudo.
+The package itself pulls in the rest of its runtime dependencies via
+`Depends:` (gvproxy, virtiofsd, qemu-system-arm, uidmap, crun,
+bash-completion) — but `podman` must be installed from the same apt
+transaction, hence the explicit line above.
 
-```bash
-sudo usermod -aG sudo <username>
-```
+Consumer users need **no sudo** — an admin provisions their kubeconfig with
+`sudo baize-kube-add-consumer <username>`. Only administrators need sudo
+(for the management scripts and `sudo -u baize` operations).
 
 ### Step 1 — Install the package
 
 ```bash
-sudo dpkg -i baize-kube_1.0_arm64.deb
+sudo dpkg -i baize-kube_<version>_arm64.deb
 ```
+
+**Optional — size the podman machine.** By default the installer creates a
+QEMU machine with 4 CPUs and 6144 MiB of memory (30 GiB disk). On a
+memory-constrained Pi you can override this before installation:
+
+```bash
+sudo env BAIZE_KUBE_MACHINE_CPUS=2 BAIZE_KUBE_MACHINE_MEMORY=4096 \
+    dpkg -i baize-kube_<version>_arm64.deb
+```
+
+Minimums: 2 CPUs, 4096 MiB (node plus guest-OS overhead). Invalid or
+below-minimum values fail the install immediately with a clear error.
 
 ### Step 2 — Reboot if prompted
 
@@ -72,21 +87,38 @@ kubectl get nodes
 # minikube   Ready    control-plane   ...   v1.x.x
 ```
 
+Run a one-shot busybox test pod (created, runs, and is auto-deleted by `--rm`):
+
+```bash
+kubectl run baize-test --image=busybox:latest --rm -it \
+    --restart=Never -- echo OK
+```
+
+For everything else — adding users, checking access, troubleshooting
+kubectl, or understanding the internals — run the built-in guide:
+
+```bash
+baize-kube-help
+```
+
 ---
 
 ## Quick start (summary)
 
 ```bash
 sudo apt install -y podman curl systemd
-sudo dpkg -i baize-kube_1.0_arm64.deb
+sudo dpkg -i baize-kube_<version>_arm64.deb
 # reboot if prompted — installation completes automatically on next boot
 kubectl get nodes
 ```
 
-To reconfigure minikube:
+To reconfigure minikube, run commands as `baize` with its runtime
+environment (see `baize-kube-help` section 5 for a ready-made `bk` function):
 
 ```bash
-sudo -u baize minikube <command>
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) \
+    CONTAINER_HOST=unix:///run/user/$(id -u baize)/podman/minikube-api.sock \
+    minikube <command>
 ```
 
 ### Management scripts
@@ -97,6 +129,9 @@ Management scripts require `sudo` because they access `/etc/baize-kube/admin-kub
 # Add a consumer user to the cluster
 sudo baize-kube-add-consumer <username>
 
+# Show the full user guide (access checks, troubleshooting, internals)
+baize-kube-help
+
 # List all provisioned consumers
 sudo baize-kube-list-consumers
 
@@ -105,6 +140,9 @@ sudo baize-kube-remove-consumer <username>
 
 # Update a consumer's kubeconfig
 sudo baize-kube-update-kubeconfig <username>
+
+# Regenerate the shared admin kubeconfig (after cluster recreation)
+sudo baize-kube-update-admin-kubeconfig
 ```
 
 ---
@@ -164,16 +202,16 @@ mkdir -p debian/usr/share/doc/baize-kube
 cp doc/*.md debian/usr/share/doc/baize-kube/
 
 # 2. Build (version must match debian/DEBIAN/control)
-dpkg-deb --build --root-owner-group debian baize-kube_1.0_arm64.deb
+dpkg-deb --build --root-owner-group debian baize-kube_<version>_arm64.deb
 
 # 3. Install on the target Pi
-sudo dpkg -i baize-kube_1.0_arm64.deb
+sudo dpkg -i baize-kube_<version>_arm64.deb
 ```
 
 **To bump the version**, edit `debian/DEBIAN/control` first:
 
 ```
-Version: 1.1
+Version: <new-version>
 ```
 
 Then rebuild, optionally renaming the output to match:
@@ -210,7 +248,9 @@ ssh <user>@<host> "sudo dpkg -i baize-kube_*.deb"
 - Raspberry Pi 5 running Raspberry Pi OS Bookworm (64-bit)
 - arm64 kernel (tested on 6.18+)
 - Internet access at install time
-- `podman` and `systemd` installed
+- `podman` and `systemd` installed (the package adds: gvproxy, virtiofsd,
+  qemu-system-arm, uidmap, crun, bash-completion)
+- ~10 GB free disk for the podman machine image and minikube node image
 
 ---
 
@@ -219,6 +259,6 @@ ssh <user>@<host> "sudo dpkg -i baize-kube_*.deb"
 | Field | Value |
 |---|---|
 | Package | baize-kube |
-| Version | 1.0 |
+| Version | (from git tag via `make build`) |
 | Architecture | arm64 |
 | Maintainer | Jean Boutros |

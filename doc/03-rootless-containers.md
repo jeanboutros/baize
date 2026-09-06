@@ -58,9 +58,31 @@ minikube config set container-runtime containerd
 
 The `containerd` runtime is required because minikube v1.39+ defaults to `containerd` for rootless mode, and using `docker` as the in-cluster runtime would reintroduce a privileged daemon.
 
+### 4. The podman machine
+
+On Debian, minikube's podman driver does not run against the host podman service directly — the package provisions a dedicated **podman machine** for the `baize` user: a lightweight QEMU-accelerated virtual machine named `minikube` (4 CPU / 6144 MB / 30 GB disk). The Kubernetes node runs as containers *inside* that machine.
+
+Three pieces of setup make this work, all performed by the installer:
+
+1. **Helper binaries.** Podman looks for its machine helpers in `/usr/libexec/podman/`, but Debian packages them elsewhere: `virtiofsd` at `/usr/libexec/virtiofsd` (outside podman's search path *and* outside `$PATH` — without the symlink, `podman machine start` fails) and `gvproxy` at `/usr/bin/gvproxy` (found only because Debian patches podman to fall back to `$PATH`). The installer links both into `/usr/libexec/podman/`.
+
+2. **KVM acceleration.** The Pi 5 exposes `/dev/kvm`. The installer adds `baize` to the `kvm` group so QEMU uses hardware virtualisation; without it, QEMU falls back to TCG software emulation, which is orders of magnitude slower.
+
+3. **Socket wiring.** The machine listens on a rootless API socket at `/run/user/<baize-uid>/podman/minikube-api.sock`. Every podman/minikube invocation for `baize` — in the installer, the systemd unit, and the management scripts — sets `CONTAINER_HOST` to that socket. `podman machine init --update-connection` also makes it `baize`'s default podman system connection.
+
+Verify the machine:
+
+```bash
+sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) podman machine ls
+# NAME       VM TYPE  CREATED  LAST UP  CPUS  MEMORY  DISK SIZE
+# minikube*  qemu     ...      Running  4     6144MB   30GB
+```
+
 ## The XDG_RUNTIME_DIR requirement
 
 Rootless Podman uses `XDG_RUNTIME_DIR` to locate its socket and state files. This is typically `/run/user/<uid>`. When a user service starts at boot via systemd lingering, systemd creates this directory automatically. The minikube service unit sets this explicitly to ensure it is always correct.
+
+Note that `XDG_RUNTIME_DIR` is only half of the story with a podman machine: `CONTAINER_HOST` must point at the machine's API socket too (see section 4 above). Every script in this package that runs commands as `baize` exports both — see `baize-kube-help` section 5 for a ready-made shell function (`bk`) that wraps them for admins.
 
 ## Limitations of rootless
 
