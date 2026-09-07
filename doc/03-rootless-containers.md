@@ -68,7 +68,7 @@ Three pieces of setup make this work, all performed by the installer:
 
 2. **KVM acceleration.** The Pi 5 exposes `/dev/kvm`. The installer adds `baize` to the `kvm` group so QEMU uses hardware virtualisation; without it, QEMU falls back to TCG software emulation, which is orders of magnitude slower.
 
-3. **Socket wiring.** The machine listens on a rootless API socket at `/run/user/<baize-uid>/podman/minikube-api.sock`. Every podman/minikube invocation for `baize` — in the installer, the systemd unit, and the management scripts — sets `CONTAINER_HOST` to that socket. `podman machine init --update-connection` also makes it `baize`'s default podman system connection.
+3. **Socket wiring.** The machine listens on a rootless API socket at `/run/user/<baize-uid>/podman/minikube-api.sock`. Every podman/minikube invocation for `baize` — in the installer, the systemd unit, and the management scripts — sets `CONTAINER_HOST` to that socket. The installer also makes it `baize`'s default podman system connection with `podman system connection default minikube` (the `machine init --update-connection` flag does not exist in podman 5.4.x).
 
 Verify the machine:
 

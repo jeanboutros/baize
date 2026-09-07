@@ -174,7 +174,11 @@ EOF
     run setup_podman_machine
     [ "$status" -eq 0 ]
     grep -q "machine init" /tmp/baize-kube-test.log
-    grep -q -- "--update-connection" /tmp/baize-kube-test.log
+    # --update-connection does NOT exist in podman 5.4.x (Debian trixie):
+    # a real install failed with "unknown flag" (regression guard).
+    ! grep -q -- "--update-connection" /tmp/baize-kube-test.log
+    # the default connection is set the portable way instead
+    grep -q "system connection default minikube" /tmp/baize-kube-test.log
 }
 
 @test "setup_podman_machine: skips init when machine already exists" {
@@ -274,4 +278,70 @@ EOF
     while IFS= read -r line; do
         [ "${#line}" -eq 62 ]
     done <<< "$out"
+}
+
+@test "download_binaries: creates the binary directory before downloading" {
+    # Regression (found on real hardware): the 1.0 -> 1.1 upgrade deleted
+    # /usr/local/bin (dpkg removes now-empty dirs from the OLD package's
+    # file list), and curl then failed with "client returned ERROR on
+    # write" — a missing destination directory, not a network error.
+    source_postinst_lib debian/DEBIAN/postinst
+    grep -q 'mkdir -p "$(dirname "$MINIKUBE_BIN")"' debian/DEBIAN/postinst
+    # and it must run BEFORE any download attempt
+    mkdir_line=$(grep -n 'mkdir -p "$(dirname "$MINIKUBE_BIN")"' debian/DEBIAN/postinst | cut -d: -f1)
+    dl_line=$(grep -n 'download_with_retry "\$MINIKUBE_URL"' debian/DEBIAN/postinst | cut -d: -f1)
+    [ -n "$mkdir_line" ]
+    [ "$mkdir_line" -lt "$dl_line" ]
+}
+
+@test "install_service: no recursive chown on user-controlled paths" {
+    # lintian recursive-privilege-change: ownership is set with plain
+    # (non-recursive) chown on exactly the service dir and unit file.
+    ! grep -q 'chown -R' debian/DEBIAN/postinst
+    grep -q 'chown "${BAIZE_USER}:${BAIZE_GROUP}" "$MINIKUBE_SERVICE_DIR"' debian/DEBIAN/postinst
+    grep -q 'chown "${BAIZE_USER}:${BAIZE_GROUP}" "$MINIKUBE_SERVICE"' debian/DEBIAN/postinst
+}
+
+@test "control: no source-package fields in the binary control" {
+    # Standards-Version is a source-package field; lintian flags it as
+    # unknown-field in a binary control.
+    ! grep -q '^Standards-Version:' debian/DEBIAN/control
+}
+
+@test "provision_user: recreates a missing home directory" {
+    # Regression (real hardware): a removed package leaves the user alive
+    # (adopted on reinstall) but its home deleted — userdel --remove took
+    # the home in a previous postrm run. podman machine init then failed
+    # with "cannot resolve /home/baize".
+    source_postinst_lib debian/DEBIAN/postinst
+    grep -q 'install -d -m 750 -o "$BAIZE_USER" -g "$BAIZE_GROUP" "$BAIZE_HOME"' debian/DEBIAN/postinst
+}
+
+@test "provision_user: home fix runs in the user-exists branch too" {
+    # The home check must be OUTSIDE the if-user-does-not-exist branch —
+    # it applies exactly when the user pre-exists (the adopt case).
+    user_exists_line=$(grep -n "User '\${BAIZE_USER}' already exists" debian/DEBIAN/postinst | cut -d: -f1)
+    home_fix_line=$(grep -n 'install -d -m 750' debian/DEBIAN/postinst | cut -d: -f1)
+    [ -n "$user_exists_line" ]
+    [ -n "$home_fix_line" ]
+    [ "$user_exists_line" -lt "$home_fix_line" ]
+}
+
+@test "provision_user: writes a .profile exporting the cluster environment" {
+    # Real-world fix: `sudo su baize` + `minikube status` failed with
+    # "unknown state" because su gives no XDG_RUNTIME_DIR/CONTAINER_HOST.
+    # The installer writes ~/.profile for the account so ANY shell into
+    # it gets a working environment.
+    source_postinst_lib debian/DEBIAN/postinst
+    grep -q 'CONTAINER_HOST=unix:///run/user/$(id -u "$BAIZE_USER")/podman/${PODMAN_MACHINE_NAME}-api.sock' debian/DEBIAN/postinst
+    grep -q 'export MINIKUBE_ROOTLESS=true' debian/DEBIAN/postinst
+    # profile must be owned by baize, not root
+    grep -q 'chown "${BAIZE_USER}:${BAIZE_GROUP}" "${BAIZE_HOME}/.profile"' debian/DEBIAN/postinst
+}
+
+@test "provision_user: .bashrc chains to .profile for non-login shells" {
+    # 'su baize -s /bin/bash' (no login flag) skips .profile; interactive
+    # bash sources .bashrc — which must chain to the same environment.
+    source_postinst_lib debian/DEBIAN/postinst
+    grep -q '. ~/.profile' debian/DEBIAN/postinst
 }

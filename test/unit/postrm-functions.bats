@@ -59,12 +59,43 @@ teardown() {
     ! grep -q 'rm -f /usr/lib/baize-kube/complete-install' debian/DEBIAN/postrm
 }
 
+
+# Build a sandboxed copy of postrm: every system path the script touches
+# (/etc/baize-kube, /etc/profile.d, /etc/systemd, /usr/local/bin,
+# /home/baize, /var/lib/baize-kube, /usr/lib/baize-kube) is redirected
+# into the test sandbox. Executing the REAL postrm against real system
+# paths makes tests flaky against host state (found after a real dpkg -i:
+# root-owned /etc files from the install made rm fail as non-root).
+make_sandboxed_postrm() {
+    local sandbox="$1"
+    mkdir -p "${sandbox}"
+    # Redirect every system path into the sandbox. Patterns use the
+    # standard quote-exit idiom: 'single-quoted part'"${expanded}"'rest'
+    # — one shell-level construct, no nested escaping.
+    sed \
+        -e 's|KUBECONFIG_DIR="/etc/baize-kube"|KUBECONFIG_DIR="'"${sandbox}"'/etc-baize-kube"|' \
+        -e 's|BAIZE_HOME="/home/baize"|BAIZE_HOME="'"${sandbox}"'/home-baize"|' \
+        -e 's|BAIZE_HOME="/home/\${BAIZE_USER}"|BAIZE_HOME="'"${sandbox}"'/home-baize"|' \
+        -e 's|DELEGATE_CONF="/etc/systemd/system/user@.service.d/delegate.conf"|DELEGATE_CONF="'"${sandbox}"'/delegate.conf"|' \
+        -e 's|PROFILE_SNIPPET="/etc/profile.d/baize-kube.sh"|PROFILE_SNIPPET="'"${sandbox}"'/profile.sh"|' \
+        -e 's|MINIKUBE_BIN="/usr/local/bin/minikube"|MINIKUBE_BIN="'"${sandbox}"'/minikube"|' \
+        -e 's|KUBECTL_BIN="/usr/local/bin/kubectl"|KUBECTL_BIN="'"${sandbox}"'/kubectl"|' \
+        -e 's|/var/lib/baize-kube|'"${sandbox}"'/var-lib|g' \
+        -e 's|/usr/lib/baize-kube|'"${sandbox}"'/usr-lib|g' \
+        -e 's|/etc/bash_completion.d/|'"${sandbox}"'/bash_completion.d/|g' \
+        -e 's|/etc/subuid|'"${sandbox}"'/subuid|g' \
+        -e 's|/etc/subgid|'"${sandbox}"'/subgid|g' \
+        debian/DEBIAN/postrm > "${MOCK_DIR}/postrm-sandbox"
+    chmod +x "${MOCK_DIR}/postrm-sandbox"
+}
+
 @test "postrm: machine removal happens before user deletion" {
     # Order matters: `podman machine rm` must run as baize BEFORE userdel.
     # We simulate by running main("remove") and checking the log order
     # of the mocked runuser (machine rm) vs the real userdel path.
     rm -f /tmp/baize-kube-test.log
-    run bash debian/DEBIAN/postrm remove
+    make_sandboxed_postrm "${MOCK_DIR}/sandbox"
+    run bash "${MOCK_DIR}/postrm-sandbox" remove
     [ "$status" -eq 0 ]
     # If the baize user does not exist (getent mock says absent), the
     # machine-removal block is skipped and the run must still succeed.
@@ -75,21 +106,17 @@ teardown() {
 @test "postrm: remove PRESERVES /etc/baize-kube, purge destroys it" {
     # Quorum decision: admin-authored consumers.conf must survive a plain
     # remove (Debian Policy 6.7) and die only on purge.
-    local confdir="${MOCK_DIR}/etc-baize-kube"
+    make_sandboxed_postrm "${MOCK_DIR}/sandbox"
+    local confdir="${MOCK_DIR}/sandbox/etc-baize-kube"
     mkdir -p "$confdir"
     echo "alice" > "${confdir}/consumers.conf"
 
-    # Patch a copy so KUBECONFIG_DIR points at our sandbox
-    sed "s|KUBECONFIG_DIR=\"/etc/baize-kube\"|KUBECONFIG_DIR=\"${confdir}\"|" \
-        debian/DEBIAN/postrm > "${MOCK_DIR}/postrm-test"
-    chmod +x "${MOCK_DIR}/postrm-test"
-
-    run bash "${MOCK_DIR}/postrm-test" remove
+    run bash "${MOCK_DIR}/postrm-sandbox" remove
     [ "$status" -eq 0 ]
     [ -f "${confdir}/consumers.conf" ]
     grep -q "Preserving" <<< "$output"
 
-    run bash "${MOCK_DIR}/postrm-test" purge
+    run bash "${MOCK_DIR}/postrm-sandbox" purge
     [ "$status" -eq 0 ]
     [ ! -e "${confdir}" ]
 }

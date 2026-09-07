@@ -322,6 +322,51 @@ provision_user() {
         info "User '${BAIZE_USER}' already exists."
     fi
 
+    # Idempotency gap found on real hardware: a previously REMOVED
+    # package deletes the home directory (postrm userdel --remove) while
+    # the user entry itself can survive (adopted above). A user without
+    # its home breaks everything downstream (runuser -l, podman machine
+    # init: "cannot resolve /home/baize"). Recreate the home if missing,
+    # and fix ownership even when it exists (an interrupted removal may
+    # leave root-owned debris). install -d = mkdir -p with -m in one step
+    # (the skeleton dirs are unnecessary for a nologin service account).
+    if [ ! -d "$BAIZE_HOME" ]; then
+        install -d -m 750 -o "$BAIZE_USER" -g "$BAIZE_GROUP" "$BAIZE_HOME"
+        success "Home directory '${BAIZE_HOME}' created (was missing)."
+    else
+        chown "${BAIZE_USER}:${BAIZE_GROUP}" "$BAIZE_HOME"
+        chmod 750 "$BAIZE_HOME"
+    fi
+
+    # Shell profile for the baize account. `sudo su baize` gives a shell
+    # WITHOUT the environment the cluster stack needs: XDG_RUNTIME_DIR (the
+    # user manager's runtime dir) and especially CONTAINER_HOST (the podman
+    # machine's API socket). Without them, `minikube status` fails with
+    # "unknown state" / "no such container" (real-world report). Sourcing
+    # this profile makes any interactive shell into the account work.
+    # The UID is resolved here (not \$(id -u)) because this file is written
+    # by root at install time for a KNOWN user.
+    cat > "${BAIZE_HOME}/.profile" <<PROFILEEOF
+# baize-kube: cluster environment for shells into the baize account.
+# Without CONTAINER_HOST, podman cannot reach the machine's API socket and
+# minikube reports "unknown state" — see baize-kube-help section 5.
+export XDG_RUNTIME_DIR=/run/user/$(id -u "$BAIZE_USER")
+export CONTAINER_HOST=unix:///run/user/$(id -u "$BAIZE_USER")/podman/${PODMAN_MACHINE_NAME}-api.sock
+export MINIKUBE_ROOTLESS=true
+PROFILEEOF
+    chown "${BAIZE_USER}:${BAIZE_GROUP}" "${BAIZE_HOME}/.profile"
+    chmod 644 "${BAIZE_HOME}/.profile"
+
+    # .bashrc for INTERACTIVE NON-LOGIN shells (e.g. 'su baize -s /bin/bash'
+    # without '-'): bash skips .profile there but sources .bashrc. Reuse
+    # the same exports by sourcing .profile — one source of truth.
+    cat > "${BAIZE_HOME}/.bashrc" <<BASHEOF
+# baize-kube: source the cluster environment (see ~/.profile).
+. ~/.profile
+BASHEOF
+    chown "${BAIZE_USER}:${BAIZE_GROUP}" "${BAIZE_HOME}/.bashrc"
+    chmod 644 "${BAIZE_HOME}/.bashrc"
+
     # Ensure KVM access for QEMU hardware acceleration.
     # The Raspberry Pi 5 exposes /dev/kvm; without kvm group membership
     # QEMU falls back to software emulation (TCG) which is unusably slow.
@@ -522,6 +567,15 @@ download_with_retry() {
 }
 
 download_binaries() {
+    # The binaries live in /usr/local/bin, which dpkg does NOT guarantee to
+    # exist: this package ships nothing under /usr/local, and a previous
+    # version of the package that DID ship files there leaves dpkg free to
+    # delete the directory on upgrade (verified on real hardware: the
+    # 1.0 -> 1.1 upgrade removed /usr/local/bin, and curl then failed with
+    # "client returned ERROR on write" because the -o target directory was
+    # missing). Ensure the directory exists before writing into it.
+    mkdir -p "$(dirname "$MINIKUBE_BIN")"
+
     # Check if minikube is already installed at the correct version.
     # -x = "file exists and is executable" test operator.
     if [ -x "$MINIKUBE_BIN" ]; then
@@ -772,19 +826,23 @@ setup_podman_machine() {
     # our ${...} here expands NOW (as root), \$(...) expands LATER (as baize).
     # To learn more, look up "quoting" and "escape character" in `man bash`.
     #
-    # Idempotency: grep -qx matches whole LINES exactly (-x) and quietly
-    # (-q); if "minikube" is listed, the machine exists. But "exists" is
-    # not enough: a machine left STOPPED (e.g. after a remove/reinstall,
-    # or an interrupted install) has no API socket, and the preflight
-    # check below would fail the whole install. So in the exists-branch
-    # we also idempotently START it: `podman machine start` on an
-    # already-running machine errors out, hence the `|| true` tolerance
-    # (the same trick the unit's ExecStartPre '-' prefix uses).
+    # Idempotency. CAREFUL WITH THE FORMAT STRING: podman 5.4 appends a
+    # trailing '*' to the name of the DEFAULT connection in machine ls
+    # output (e.g. "minikube*"), so a whole-line grep -qx "minikube"
+    # NEVER matches once the machine is the default — which is exactly
+    # what this installer makes it (verified on a real reinstall: init
+    # failed with "VM already exists"). Anchor the match on the name and
+    # tolerate the marker: ^name\*?$. "Exists" is also not enough: a
+    # machine left STOPPED (reinstall, interrupted install) has no API
+    # socket and the preflight below would fail the install — so the
+    # exists-branch also idempotently STARTS it (`podman machine start`
+    # on a running machine errors out, hence `|| true` tolerance — the
+    # same trick the unit's ExecStartPre '-' prefix uses).
     if runuser -l "$BAIZE_USER" -s /bin/bash -c "
         export HOME=${BAIZE_HOME}
         export XDG_RUNTIME_DIR=/run/user/\$(id -u)
         ${PODMAN_BIN} machine ls --format '{{.Name}}' 2>/dev/null
-    " 2>/dev/null | grep -qx "$PODMAN_MACHINE_NAME"; then
+    " 2>/dev/null | grep -qx "${PODMAN_MACHINE_NAME}\(*\)\{0,1\}"; then
         info "Podman machine '${PODMAN_MACHINE_NAME}' already exists — ensuring it is running..."
         runuser -l "$BAIZE_USER" -s /bin/bash -c "
             export HOME=${BAIZE_HOME}
@@ -795,9 +853,15 @@ setup_podman_machine() {
     fi
 
     # podman machine init flags: --cpus, --memory (MiB), --disk-size (GiB),
-    # --now (also start immediately), --update-connection (set as default
-    # podman connection for this user). The machine downloads a ~600 MB
+    # --now (also start immediately). The machine downloads a ~600 MB
     # Fedora CoreOS image on first init — this is the slowest install step.
+    #
+    # VERSION PORTABILITY NOTE: --update-connection (-u) does NOT exist
+    # in podman 5.4.x (Debian trixie) — it was verified against a newer
+    # CLI during design and failed the real install with "unknown flag".
+    # Making the machine the user's DEFAULT podman connection is done
+    # below with `podman system connection default` instead, which has
+    # been stable across podman versions.
     runuser -l "$BAIZE_USER" -s /bin/bash -c "
         export HOME=${BAIZE_HOME}
         export XDG_RUNTIME_DIR=/run/user/\$(id -u)
@@ -806,9 +870,20 @@ setup_podman_machine() {
             --memory ${PODMAN_MACHINE_MEMORY} \
             --disk-size ${PODMAN_MACHINE_DISK} \
             --now \
-            --update-connection \
             ${PODMAN_MACHINE_NAME}
     " || fail "podman machine init failed. Check: sudo -u baize env XDG_RUNTIME_DIR=/run/user/$(id -u baize) podman machine ls"
+
+    # Set the machine's ROOTLESS connection as baize's default podman
+    # connection. `machine init` creates two connections ("<name>" for
+    # the rootless/user socket and "<name>-root" for the root one);
+    # --format {{.Name}} lists them. The rootless one is the design-
+    # critical choice: it is what makes the kubeconfig endpoint host-
+    # reachable via port-forwarding (see doc/05).
+    runuser -l "$BAIZE_USER" -s /bin/bash -c "
+        export HOME=${BAIZE_HOME}
+        export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+        ${PODMAN_BIN} system connection default ${PODMAN_MACHINE_NAME} 2>/dev/null || true
+    " 2>/dev/null || true
 
     success "Podman machine '${PODMAN_MACHINE_NAME}' created and started."
 }
@@ -908,10 +983,13 @@ install_service() {
     local uid
     uid=$(id -u "$BAIZE_USER")
 
+    # The unit directory (and the unit file we write below) must belong to
+    # baize because ITS user manager reads them. Ownership is set with
+    # NON-recursive chown on exactly two paths — a chown -R would clobber
+    # anything else baize's tools keep under ~/.config (lintian:
+    # recursive-privilege-change).
     mkdir -p "$MINIKUBE_SERVICE_DIR"
-    # chown -R changes owner recursively — the whole .config tree must
-    # belong to baize because ITS user manager reads the unit, not root's.
-    chown -R "${BAIZE_USER}:${BAIZE_GROUP}" "${BAIZE_HOME}/.config"
+    chown "${BAIZE_USER}:${BAIZE_GROUP}" "$MINIKUBE_SERVICE_DIR"
 
     # Here-doc with UNQUOTED EOF: $uid, ${MINIKUBE_BIN}, ... are expanded by
     # THIS script before cat writes the file — so the finished unit has the

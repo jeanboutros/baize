@@ -136,7 +136,17 @@ Regenerate the SHARED admin kubeconfig (after cluster recreation):
 All minikube operations must run as the baize user, which needs two
 environment variables: XDG_RUNTIME_DIR (where systemd per-user sockets
 live) and CONTAINER_HOST (where the podman machine API socket is).
-Rather than typing them every time, define a helper function:
+
+To get a shell AS the cluster owner, use a login shell with an explicit
+bash (the account is nologin by design — plain 'sudo su baize' says
+"This account is currently not available"):
+
+  sudo su - baize -s /bin/bash
+
+The account's ~/.profile (installed by the package) sets XDG_RUNTIME_DIR
+and CONTAINER_HOST automatically, so plain 'minikube status' works there.
+For running single commands as baize FROM your admin shell, define a
+helper function:
 
   bk() { sudo -u baize env \
       XDG_RUNTIME_DIR=/run/user/$(id -u baize) \

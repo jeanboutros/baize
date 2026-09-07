@@ -91,8 +91,12 @@ case "$cmd" in
         case "$sub" in
             ls|list)
                 echo "podman machine $*" >> "$LOG"
+                # REAL-WORLD FIDELITY: podman 5.4 appends '*' to the
+                # DEFAULT connection's name in machine ls output. The
+                # previous bare-name mock hid the idempotency bug where
+                # grep -qx "minikube" never matched "minikube*".
                 if [ -f "$MACHINES" ] && grep -qx "minikube" "$MACHINES"; then
-                    echo "minikube"
+                    echo "minikube*"
                 fi
                 exit 0
                 ;;
