@@ -60,7 +60,7 @@ jobs:
                 echo "Broken link in $f: $link -> $target (not found)"
                 errors=1
               fi
-            done < <(grep -oP '\]\([^)#]+\.md\)' "$f" | sed 's/.*](\(.*\))/\1/')
+            done < <(grep -oP '\]\((?![A-Za-z][A-Za-z0-9+.-]*:)[^)#]+\.md\)' "$f" | sed 's/.*](\(.*\))/\1/')
           done
           exit $errors
 
